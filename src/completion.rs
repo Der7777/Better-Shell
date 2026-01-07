@@ -2,28 +2,28 @@ use std::collections::HashMap;
 use std::env;
 use std::fs;
 
-use rustyline::Editor;
 use rustyline::completion::{Completer, FilenameCompleter, Pair};
 use rustyline::error::ReadlineError;
 use rustyline::highlight::{Highlighter, MatchingBracketHighlighter};
 use rustyline::hint::Hinter;
 use rustyline::history::{DefaultHistory, SearchDirection};
 use rustyline::validate::{MatchingBracketValidator, Validator};
+use rustyline::Editor;
 use rustyline::{Context, Helper};
 
 #[cfg(feature = "tree-sitter")]
 use tree_sitter::Parser;
 #[cfg(feature = "tree-sitter")]
-use tree_sitter_highlight::{HighlightConfiguration, Highlighter as TSHighlighter, HighlightEvent};
-#[cfg(feature = "tree-sitter")]
 use tree_sitter_bash;
+#[cfg(feature = "tree-sitter")]
+use tree_sitter_highlight::{HighlightConfiguration, HighlightEvent, Highlighter as TSHighlighter};
 
 use std::cell::RefCell;
 
+use crate::colors::{resolve_color, ColorConfig};
+use crate::completions::{completion_candidates, CompletionSet};
 use crate::job_control::Job;
-use crate::colors::{ColorConfig, resolve_color};
-use crate::completions::{CompletionSet, completion_candidates};
-use crate::parse::{OPERATOR_TOKEN_MARKER, parse_line};
+use crate::parse::{parse_line, OPERATOR_TOKEN_MARKER};
 pub struct SyntaxHighlighter {
     bracket_highlighter: MatchingBracketHighlighter,
     ts_highlighter: RefCell<TSHighlighter>,
@@ -34,12 +34,9 @@ pub struct SyntaxHighlighter {
 impl SyntaxHighlighter {
     pub fn new() -> Self {
         let highlight_query = "";
-        let mut config = HighlightConfiguration::new(
-            tree_sitter_bash::language(),
-            highlight_query,
-            "",
-            "",
-        ).unwrap();
+        let mut config =
+            HighlightConfiguration::new(tree_sitter_bash::language(), highlight_query, "", "")
+                .unwrap();
         config.configure(&[
             "attribute",
             "constant",
@@ -76,7 +73,10 @@ impl Highlighter for SyntaxHighlighter {
         let _tree = parser.parse(line, None).unwrap();
         let highlights = {
             let mut highlighter = self.ts_highlighter.borrow_mut();
-            highlighter.highlight(&self.config, line.as_bytes(), None, |_| None).unwrap().collect::<Vec<_>>()
+            highlighter
+                .highlight(&self.config, line.as_bytes(), None, |_| None)
+                .unwrap()
+                .collect::<Vec<_>>()
         };
         let mut result = String::new();
         let mut current_highlight: Option<usize> = None;
@@ -92,16 +92,16 @@ impl Highlighter for SyntaxHighlighter {
                     let text = &line[start..end];
                     if let Some(idx) = current_highlight {
                         let color = match idx {
-                            0 => "\x1b[32m", // green for attribute
-                            1 => "\x1b[34m", // blue for constant
-                            2 => "\x1b[35m", // magenta for function.builtin
-                            3 => "\x1b[35m", // magenta for function
-                            4 => "\x1b[31m", // red for keyword
-                            5 => "\x1b[33m", // yellow for operator
-                            6 => "\x1b[36m", // cyan for property
-                            7 => "\x1b[37m", // white for punctuation
-                            8 => "\x1b[37m", // white for punctuation.bracket
-                            9 => "\x1b[37m", // white for punctuation.delimiter
+                            0 => "\x1b[32m",  // green for attribute
+                            1 => "\x1b[34m",  // blue for constant
+                            2 => "\x1b[35m",  // magenta for function.builtin
+                            3 => "\x1b[35m",  // magenta for function
+                            4 => "\x1b[31m",  // red for keyword
+                            5 => "\x1b[33m",  // yellow for operator
+                            6 => "\x1b[36m",  // cyan for property
+                            7 => "\x1b[37m",  // white for punctuation
+                            8 => "\x1b[37m",  // white for punctuation.bracket
+                            9 => "\x1b[37m",  // white for punctuation.delimiter
                             10 => "\x1b[32m", // green for string
                             11 => "\x1b[32m", // green for string.special
                             12 => "\x1b[36m", // cyan for tag
@@ -308,9 +308,11 @@ fn collect_commands(
 ) -> Vec<String> {
     let mut entries = Vec::new();
     entries.extend(
-        ["cd", "pwd", "jobs", "fg", "bg", "help", "exit", "set", "abbr", "complete"]
-            .iter()
-            .map(|s| s.to_string()),
+        [
+            "cd", "pwd", "jobs", "fg", "bg", "help", "exit", "set", "abbr", "complete",
+        ]
+        .iter()
+        .map(|s| s.to_string()),
     );
     entries.extend(aliases.keys().cloned());
     entries.extend(functions.keys().cloned());
@@ -420,7 +422,11 @@ fn edit_distance(a: &str, b: &str, max: usize) -> usize {
         cur[0] = i;
         let mut row_min = cur[0];
         for j in 1..=blen {
-            let cost = if a_bytes[i - 1] == b_bytes[j - 1] { 0 } else { 1 };
+            let cost = if a_bytes[i - 1] == b_bytes[j - 1] {
+                0
+            } else {
+                1
+            };
             let insert = cur[j - 1] + 1;
             let delete = prev[j] + 1;
             let replace = prev[j - 1] + cost;

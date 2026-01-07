@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::process::Command;
 
-use crate::colors::{ColorConfig, resolve_color};
+use crate::colors::{resolve_color, ColorConfig};
 
 #[derive(Clone, Copy, Debug)]
 pub enum PromptTheme {
@@ -79,9 +79,7 @@ fn render_fish_prompt(colors: &ColorConfig, last_status: i32, cwd: &Path) -> Str
     } else {
         format!("{symbol_color}>{reset}")
     };
-    format!(
-        "{status}{cwd_text} {git}{symbol} "
-    )
+    format!("{status}{cwd_text} {git}{symbol} ")
 }
 
 fn git_prompt_info(cwd: &Path) -> Option<String> {
@@ -104,7 +102,9 @@ fn git_prompt_info(cwd: &Path) -> Option<String> {
     if !branch_out.status.success() {
         return None;
     }
-    let mut branch = String::from_utf8_lossy(&branch_out.stdout).trim().to_string();
+    let mut branch = String::from_utf8_lossy(&branch_out.stdout)
+        .trim()
+        .to_string();
     if branch == "HEAD" {
         let hash_out = Command::new("git")
             .arg("rev-parse")
@@ -124,7 +124,9 @@ fn git_prompt_info(cwd: &Path) -> Option<String> {
         .output()
         .ok()?;
     let dirty = status_out.status.success()
-        && !String::from_utf8_lossy(&status_out.stdout).trim().is_empty();
+        && !String::from_utf8_lossy(&status_out.stdout)
+            .trim()
+            .is_empty();
     if dirty {
         Some(format!("({branch}*)"))
     } else {

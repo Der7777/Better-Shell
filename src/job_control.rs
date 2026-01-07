@@ -3,17 +3,17 @@ use std::os::fd::BorrowedFd;
 use std::os::unix::process::CommandExt;
 use std::process::Command;
 use std::sync::{
-    Arc,
     atomic::{AtomicI32, Ordering},
+    Arc,
 };
 
 use log::{debug, warn};
 use nix::sys::signal::{
-    SaFlags, SigAction, SigHandler, SigSet, SigmaskHow, Signal, kill, sigaction, sigprocmask,
+    kill, sigaction, sigprocmask, SaFlags, SigAction, SigHandler, SigSet, SigmaskHow, Signal,
 };
-use nix::sys::termios::{SetArg, Termios, tcgetattr, tcsetattr};
-use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
-use nix::unistd::{Pid, setpgid, tcsetpgrp};
+use nix::sys::termios::{tcgetattr, tcsetattr, SetArg, Termios};
+use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
+use nix::unistd::{setpgid, tcsetpgrp, Pid};
 
 pub fn set_process_group(command: &mut Command, fg_pgid: &Arc<AtomicI32>) {
     let fg_pgid = Arc::clone(fg_pgid);
@@ -48,8 +48,7 @@ fn reset_ignored_signals() -> io::Result<()> {
         Signal::SIGTTIN,
         Signal::SIGTTOU,
     ] {
-        unsafe { sigaction(sig, &action) }
-            .map_err(|err| io::Error::other(err.to_string()))?;
+        unsafe { sigaction(sig, &action) }.map_err(|err| io::Error::other(err.to_string()))?;
     }
     Ok(())
 }
@@ -284,8 +283,7 @@ pub fn bring_job_foreground(
 
 pub fn continue_job(pgid: i32) -> io::Result<()> {
     debug!("job event=cont pgid={}", pgid);
-    kill(Pid::from_raw(-pgid), Signal::SIGCONT)
-        .map_err(|err| io::Error::other(err.to_string()))
+    kill(Pid::from_raw(-pgid), Signal::SIGCONT).map_err(|err| io::Error::other(err.to_string()))
 }
 
 pub fn wait_for_process_group(
@@ -444,7 +442,7 @@ fn poll_job_status(pgid: i32) -> JobPoll {
 mod tests {
     use super::*;
     use nix::errno::Errno;
-    use nix::sys::signal::{Signal, kill};
+    use nix::sys::signal::{kill, Signal};
     use nix::sys::wait::waitpid;
 
     fn spawn_in_own_pgid(command: &str, args: &[&str]) -> io::Result<i32> {

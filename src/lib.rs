@@ -35,7 +35,7 @@ pub fn fuzz_parse_bytes(data: &[u8]) {
 }
 
 #[cfg(feature = "expansion")]
-pub use expansion::{ExpansionContext, expand_globs, expand_token, expand_tokens, glob_pattern};
+pub use expansion::{expand_globs, expand_token, expand_tokens, glob_pattern, ExpansionContext};
 
 /// Fuzz helper for parser+expansion targets.
 #[cfg(feature = "expansion")]

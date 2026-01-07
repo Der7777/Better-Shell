@@ -1,7 +1,7 @@
 use std::io;
 
 use log::debug;
-use nix::sys::signal::{SaFlags, SigAction, SigHandler, SigSet, Signal, sigaction};
+use nix::sys::signal::{sigaction, SaFlags, SigAction, SigHandler, SigSet, Signal};
 
 pub fn install_signal_handlers() -> io::Result<()> {
     let action = SigAction::new(SigHandler::SigIgn, SaFlags::SA_RESTART, SigSet::empty());

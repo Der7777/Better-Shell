@@ -1,4 +1,4 @@
-use custom_shell::{SeqOp, parse_pipeline, parse_sequence, parse_tokens};
+use custom_shell::{parse_pipeline, parse_sequence, parse_tokens, SeqOp};
 
 #[test]
 fn pipeline_black_box() {

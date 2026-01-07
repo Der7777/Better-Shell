@@ -1,8 +1,8 @@
 use std::io;
 
-use rustyline::Editor;
 use rustyline::error::ReadlineError;
 use rustyline::history::DefaultHistory;
+use rustyline::Editor;
 
 use crate::completion::LineHelper;
 

@@ -1,5 +1,5 @@
-use rustyline::Editor;
 use rustyline::history::DefaultHistory;
+use rustyline::Editor;
 
 use crate::completion::LineHelper;
 use crate::io_helpers::read_heredoc;

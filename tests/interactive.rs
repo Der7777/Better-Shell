@@ -1,6 +1,6 @@
 #![cfg(all(target_os = "linux", feature = "pty-tests"))]
 
-use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use serial_test::serial;
 use std::fs;
 use std::io::{Read, Write};

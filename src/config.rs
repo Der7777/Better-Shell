@@ -4,10 +4,10 @@ use std::fs;
 use std::io;
 use std::path::Path;
 
-use crate::colors::{ColorConfig, load_color_lines};
-use crate::execution::{SandboxConfig, apply_sandbox_directive};
-use crate::prompt::{PromptTheme, parse_prompt_theme, render_prompt_template, render_prompt_theme};
-use crate::parse::{OPERATOR_TOKEN_MARKER, parse_line, parse_sandbox_value};
+use crate::colors::{load_color_lines, ColorConfig};
+use crate::execution::{apply_sandbox_directive, SandboxConfig};
+use crate::parse::{parse_line, parse_sandbox_value, OPERATOR_TOKEN_MARKER};
+use crate::prompt::{parse_prompt_theme, render_prompt_template, render_prompt_theme, PromptTheme};
 use crate::utils::is_valid_var_name;
 
 pub fn build_prompt(
@@ -130,7 +130,8 @@ pub fn load_config(
                 *prompt_template = Some(value.to_string());
                 continue;
             }
-            if key.eq_ignore_ascii_case("prompt_function") || key.eq_ignore_ascii_case("prompt_func")
+            if key.eq_ignore_ascii_case("prompt_function")
+                || key.eq_ignore_ascii_case("prompt_func")
             {
                 if value.trim().is_empty() {
                     *prompt_function = None;
@@ -242,8 +243,8 @@ fn parse_abbreviation(
         return Err(format!("invalid abbr name '{name}' on line {line}"));
     }
     let value = strip_quotes(value);
-    let tokens = parse_line(value)
-        .map_err(|err| format!("abbr parse error on line {line}: {err}"))?;
+    let tokens =
+        parse_line(value).map_err(|err| format!("abbr parse error on line {line}: {err}"))?;
     if tokens.is_empty() {
         return Err(format!("abbr '{name}' empty on line {line}"));
     }
@@ -312,7 +313,19 @@ fn needs_quotes(ch: char) -> bool {
     ch.is_whitespace()
         || matches!(
             ch,
-            '\'' | '"' | '\\' | '$' | '`' | '#' | '|' | '&' | ';' | '<' | '>' | '(' | ')' | '{'
+            '\'' | '"'
+                | '\\'
+                | '$'
+                | '`'
+                | '#'
+                | '|'
+                | '&'
+                | ';'
+                | '<'
+                | '>'
+                | '('
+                | ')'
+                | '{'
                 | '}'
         )
 }

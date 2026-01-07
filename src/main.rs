@@ -1,5 +1,5 @@
-use rustyline::{Config, EditMode, Editor};
 use rustyline::history::DefaultHistory;
+use rustyline::{Config, EditMode, Editor};
 use signal_hook::consts::signal::SIGCHLD;
 use signal_hook::flag;
 use std::collections::HashMap;
@@ -7,42 +7,45 @@ use std::env;
 use std::io;
 use std::path::PathBuf;
 use std::sync::{
-    Arc,
     atomic::{AtomicBool, AtomicI32, Ordering},
+    Arc,
 };
 
 mod builtins;
+mod colors;
 mod completion;
 mod completions;
 mod config;
-mod colors;
-mod prompt;
 mod execution;
 mod expansion;
 mod heredoc;
 mod io_helpers;
 mod job_control;
 mod parse;
+mod prompt;
 mod signals;
 mod utils;
 
 use builtins::{execute_builtin, execute_builtin_substitution, is_builtin, try_execute_compound};
-use completion::LineHelper;
-use completions::{CompletionSet, default_completions, load_completion_files, suggest_command};
-use config::{apply_abbreviations, apply_aliases, build_prompt, load_config};
 use colors::ColorConfig;
-use prompt::PromptTheme;
+use completion::LineHelper;
+use completions::{default_completions, load_completion_files, suggest_command, CompletionSet};
+use config::{apply_abbreviations, apply_aliases, build_prompt, load_config};
 use execution::{
-    SandboxConfig, apply_sandbox_directive, build_command, run_pipeline, run_pipeline_capture,
+    apply_sandbox_directive, build_command, run_pipeline, run_pipeline_capture,
     sandbox_options_for_command, spawn_command_background, spawn_pipeline_background,
-    status_from_error,
+    status_from_error, SandboxConfig,
 };
-use expansion::{ExpansionContext, expand_globs, expand_tokens};
+use expansion::{expand_globs, expand_tokens, ExpansionContext};
 use io_helpers::{normalize_command_output, read_input_line};
-use job_control::{Job, JobStatus, WaitOutcome, add_job_with_status, reap_jobs};
+use job_control::{add_job_with_status, reap_jobs, Job, JobStatus, WaitOutcome};
+use prompt::PromptTheme;
 use signals::{init_session, install_signal_handlers};
 
-use parse::{CommandSpec, SeqOp, SandboxDirective, parse_line, parse_sandbox_value, split_pipeline, split_sequence};
+use parse::{
+    parse_line, parse_sandbox_value, split_pipeline, split_sequence, CommandSpec, SandboxDirective,
+    SeqOp,
+};
 
 fn main() {
     init_logging();
@@ -95,7 +98,10 @@ fn main() {
     };
     editor.set_helper(Some(LineHelper::new()));
 
-    let history_path = env::var("HOME").map(PathBuf::from).unwrap_or_default().join(".custom_shell_history");
+    let history_path = env::var("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_default()
+        .join(".custom_shell_history");
     let _ = editor.load_history(&history_path);
 
     let mut state = ShellState {
@@ -195,7 +201,10 @@ fn run_once(state: &mut ShellState) -> io::Result<()> {
             if state.interactive {
                 println!();
             }
-            let history_path = env::var("HOME").map(PathBuf::from).unwrap_or_default().join(".custom_shell_history");
+            let history_path = env::var("HOME")
+                .map(PathBuf::from)
+                .unwrap_or_default()
+                .join(".custom_shell_history");
             let _ = state.editor.save_history(&history_path);
             std::process::exit(0);
         }

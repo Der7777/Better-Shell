@@ -4,8 +4,8 @@ use std::os::fd::{FromRawFd, IntoRawFd};
 use std::os::unix::process::ExitStatusExt;
 use std::process::{Command, Stdio};
 use std::sync::{
-    Arc,
     atomic::{AtomicI32, Ordering},
+    Arc,
 };
 
 use log::debug;
@@ -18,8 +18,8 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::process::CommandExt;
 
 use crate::job_control::{
-    SignalMaskGuard, TerminalGuard, TermiosGuard, WaitOutcome, WaitResult, set_process_group,
-    set_process_group_explicit, wait_for_process_group,
+    set_process_group, set_process_group_explicit, wait_for_process_group, SignalMaskGuard,
+    TerminalGuard, TermiosGuard, WaitOutcome, WaitResult,
 };
 use crate::parse::{CommandSpec, SandboxDirective};
 
@@ -635,7 +635,9 @@ fn apply_sandbox(command: &mut Command, options: &SandboxOptions) -> io::Result<
             SandboxBackend::Bubblewrap => {
                 let program = command.get_program().to_os_string();
                 let args: Vec<_> = command.get_args().map(|arg| arg.to_os_string()).collect();
-                let bwrap_path = options.bubblewrap_path.unwrap_or_else(|| "bwrap".to_string());
+                let bwrap_path = options
+                    .bubblewrap_path
+                    .unwrap_or_else(|| "bwrap".to_string());
                 let bwrap_path_os = std::ffi::OsString::from(bwrap_path);
                 let mut bwrap_args = options
                     .bubblewrap_args
@@ -648,10 +650,7 @@ fn apply_sandbox(command: &mut Command, options: &SandboxOptions) -> io::Result<
                 unsafe {
                     command.pre_exec(move || {
                         execvp_os(&bwrap_path_os, &bwrap_args).map_err(|err| {
-                            io::Error::new(
-                                err.kind(),
-                                format!("bwrap exec failed: {err}"),
-                            )
+                            io::Error::new(err.kind(), format!("bwrap exec failed: {err}"))
                         })
                     });
                 }
@@ -684,9 +683,8 @@ fn execvp_os(program: &std::ffi::OsStr, args: &[std::ffi::OsString]) -> io::Resu
     let mut argv = Vec::with_capacity(args.len() + 1);
     argv.push(prog_c.clone());
     for arg in args {
-        let cstr = CString::new(arg.as_bytes()).map_err(|_| {
-            io::Error::new(io::ErrorKind::InvalidInput, "argument contains null")
-        })?;
+        let cstr = CString::new(arg.as_bytes())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "argument contains null"))?;
         argv.push(cstr);
     }
     nix::unistd::execvp(&prog_c, &argv).map_err(|err| io::Error::other(err.to_string()))?;
@@ -694,7 +692,10 @@ fn execvp_os(program: &std::ffi::OsStr, args: &[std::ffi::OsString]) -> io::Resu
 }
 
 #[cfg(feature = "sandbox")]
-fn native_sandbox_exec(program: &std::ffi::OsString, args: &[std::ffi::OsString]) -> io::Result<()> {
+fn native_sandbox_exec(
+    program: &std::ffi::OsString,
+    args: &[std::ffi::OsString],
+) -> io::Result<()> {
     // Placeholder for advanced native sandbox setup.
     execvp_os(program, args)
 }

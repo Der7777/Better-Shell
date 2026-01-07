@@ -86,7 +86,14 @@ pub fn save_colors(config: &ColorConfig) -> io::Result<()> {
     };
     let path = format!("{home}/.minishell_colors");
     let content = format_color_lines(config).join("\n");
-    fs::write(path, if content.is_empty() { content } else { format!("{content}\n") })
+    fs::write(
+        path,
+        if content.is_empty() {
+            content
+        } else {
+            format!("{content}\n")
+        },
+    )
 }
 
 pub fn load_color_lines(config: &mut ColorConfig, content: &str) {

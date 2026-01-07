@@ -1,7 +1,7 @@
 use glob::glob;
 
 use crate::parse::{
-    ESCAPE_MARKER, NOGLOB_MARKER, OPERATOR_TOKEN_MARKER, parse_command_substitution, strip_markers,
+    parse_command_substitution, strip_markers, ESCAPE_MARKER, NOGLOB_MARKER, OPERATOR_TOKEN_MARKER,
 };
 use crate::utils::is_valid_var_name;
 

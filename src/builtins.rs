@@ -1,31 +1,40 @@
 use std::io;
 use std::sync::Arc;
 
-use crate::config::{format_abbreviation_line, save_abbreviations};
 use crate::colors::{apply_color_setting, format_color_lines, resolve_color, save_colors};
 use crate::completions::{
     apply_completion_tokens, format_completion_lines, save_completion_file, suggest_command,
 };
+use crate::config::{format_abbreviation_line, save_abbreviations};
 use crate::execution::{
     build_command, run_command_in_foreground, sandbox_options_for_command, status_from_error,
 };
 use crate::expansion::{expand_globs, expand_tokens};
 use crate::io_helpers::read_input_line;
 use crate::job_control::{
-    JobStatus, WaitOutcome, add_job_with_status, bring_job_foreground, continue_job, find_job,
-    list_jobs, parse_job_id, take_job,
+    add_job_with_status, bring_job_foreground, continue_job, find_job, list_jobs, parse_job_id,
+    take_job, JobStatus, WaitOutcome,
 };
 use crate::parse::split_sequence;
-use crate::parse::{CommandSpec, OPERATOR_TOKEN_MARKER, SeqOp, parse_line, token_str};
+use crate::parse::{parse_line, token_str, CommandSpec, SeqOp, OPERATOR_TOKEN_MARKER};
 use crate::utils::is_valid_var_name;
-use crate::{ShellState, build_expansion_context, execute_segment, trace_tokens};
+use crate::{build_expansion_context, execute_segment, trace_tokens, ShellState};
 
 pub fn is_builtin(cmd: Option<&str>) -> bool {
     matches!(
         cmd,
         Some(
-            "exit" | "cd" | "pwd" | "jobs" | "fg" | "bg" | "help" | "abbr" | "complete"
-                | "set_color" | "fish_config"
+            "exit"
+                | "cd"
+                | "pwd"
+                | "jobs"
+                | "fg"
+                | "bg"
+                | "help"
+                | "abbr"
+                | "complete"
+                | "set_color"
+                | "fish_config"
         )
     )
 }

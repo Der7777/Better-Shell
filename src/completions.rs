@@ -7,16 +7,7 @@ use std::process::Command;
 use crate::parse::parse_line;
 
 const BUILTIN_COMMANDS: &[&str] = &[
-    "cd",
-    "pwd",
-    "jobs",
-    "fg",
-    "bg",
-    "help",
-    "exit",
-    "set",
-    "abbr",
-    "complete",
+    "cd", "pwd", "jobs", "fg", "bg", "help", "exit", "set", "abbr", "complete",
 ];
 
 #[derive(Clone, Debug, Default)]
@@ -62,14 +53,19 @@ pub fn default_completions() -> CompletionSet {
         .map(|s| s.to_string())
         .collect(),
     );
-    set.add_dynamic(
-        "git",
-        "git branch --format='%(refname:short)'".to_string(),
-    );
+    set.add_dynamic("git", "git branch --format='%(refname:short)'".to_string());
     set.add_static(
         "ls",
         vec![
-            "-a", "-l", "-h", "-t", "-r", "--all", "--long", "--human-readable", "--help",
+            "-a",
+            "-l",
+            "-h",
+            "-t",
+            "-r",
+            "--all",
+            "--long",
+            "--human-readable",
+            "--help",
         ]
         .into_iter()
         .map(|s| s.to_string())
@@ -198,10 +194,7 @@ pub fn format_completion_lines(set: &CompletionSet) -> Vec<String> {
             out.push(format!("complete -c {name} -a '{items}'"));
         }
         for script in &spec.dynamic_commands {
-            out.push(format!(
-                "complete -c {name} -x {}",
-                shell_quote(script)
-            ));
+            out.push(format!("complete -c {name} -x {}", shell_quote(script)));
         }
     }
     out
@@ -213,7 +206,14 @@ pub fn save_completion_file(set: &CompletionSet) -> io::Result<()> {
     };
     let path = format!("{home}/.minishell_completions");
     let content = format_completion_lines(set).join("\n");
-    fs::write(path, if content.is_empty() { content } else { format!("{content}\n") })
+    fs::write(
+        path,
+        if content.is_empty() {
+            content
+        } else {
+            format!("{content}\n")
+        },
+    )
 }
 
 pub fn completion_candidates(set: &CompletionSet, command: &str) -> Vec<String> {
@@ -320,7 +320,11 @@ fn edit_distance(a: &str, b: &str, max: usize) -> usize {
         cur[0] = i;
         let mut row_min = cur[0];
         for j in 1..=blen {
-            let cost = if a_bytes[i - 1] == b_bytes[j - 1] { 0 } else { 1 };
+            let cost = if a_bytes[i - 1] == b_bytes[j - 1] {
+                0
+            } else {
+                1
+            };
             let insert = cur[j - 1] + 1;
             let delete = prev[j] + 1;
             let replace = prev[j - 1] + cost;
@@ -359,7 +363,19 @@ fn needs_quotes(ch: char) -> bool {
     ch.is_whitespace()
         || matches!(
             ch,
-            '\'' | '"' | '\\' | '$' | '`' | '#' | '|' | '&' | ';' | '<' | '>' | '(' | ')' | '{'
+            '\'' | '"'
+                | '\\'
+                | '$'
+                | '`'
+                | '#'
+                | '|'
+                | '&'
+                | ';'
+                | '<'
+                | '>'
+                | '('
+                | ')'
+                | '{'
                 | '}'
         )
 }
