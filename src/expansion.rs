@@ -5,6 +5,7 @@ use crate::parse::{
     parse_command_substitution, parse_command_substitution_lenient, strip_markers, ESCAPE_MARKER,
     NOGLOB_MARKER, OPERATOR_TOKEN_MARKER,
 };
+use glob::Pattern;
 use crate::utils::is_valid_var_name;
 
 mod glob;
@@ -15,6 +16,7 @@ type CommandSubst<'a> = Box<dyn Fn(&str) -> Result<String, String> + 'a>;
 
 pub struct ExpansionContext<'a> {
     pub lookup_var: LookupVar<'a>,
+    pub lookup_array: Box<dyn Fn(&str) -> Option<Vec<String>> + 'a>,
     pub command_subst: CommandSubst<'a>,
     // Separate positional slice for function-style parameters.
     pub positional: &'a [String],
@@ -26,6 +28,11 @@ pub fn expand_tokens(
     ctx: &ExpansionContext<'_>,
 ) -> Result<Vec<String>, String> {
     let mut expanded = Vec::new();
+    let ifs = ctx
+        .lookup_var
+        .as_ref()("IFS")
+        .unwrap_or_else(|| " \t\n".to_string());
+    let ifs_chars: Vec<char> = ifs.chars().collect();
     for token in tokens {
         if token.starts_with(OPERATOR_TOKEN_MARKER) {
             expanded.push(token);
@@ -33,10 +40,49 @@ pub fn expand_tokens(
         }
         for brace_token in expand_braces(&token) {
             let value = expand_token(&brace_token, ctx)?;
-            expanded.push(value);
+            let fields = split_ifs_token(&value, &ifs_chars);
+            if fields.is_empty() {
+                continue;
+            }
+            expanded.extend(fields);
         }
     }
     Ok(expanded)
+}
+
+fn split_ifs_token(token: &str, ifs: &[char]) -> Vec<String> {
+    if ifs.is_empty() {
+        return vec![token.to_string()];
+    }
+    let mut fields = Vec::new();
+    let mut buf = String::new();
+    let mut chars = token.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if ch == ESCAPE_MARKER || ch == NOGLOB_MARKER {
+            if let Some(next) = chars.next() {
+                buf.push(ch);
+                buf.push(next);
+            } else {
+                buf.push(ch);
+            }
+            continue;
+        }
+        if ifs.contains(&ch) {
+            if !buf.is_empty() {
+                fields.push(buf);
+                buf = String::new();
+            }
+            continue;
+        }
+        buf.push(ch);
+    }
+
+    if !buf.is_empty() {
+        fields.push(buf);
+    }
+
+    fields
 }
 
 pub fn expand_token(token: &str, ctx: &ExpansionContext<'_>) -> Result<String, String> {
@@ -159,8 +205,8 @@ where
                 }
                 return Ok(Some(format!("${{{inner}")));
             }
-            let (name, fallback) = split_parameter(&inner)?;
-            let name = strip_markers(name);
+            let param = parse_parameter(&inner)?;
+            let name = strip_markers(param.name());
             if !is_valid_var_name(&name) {
                 if ctx.strict {
                     return Err(ShellError::new(
@@ -172,14 +218,58 @@ where
                 }
                 return Ok(Some(format!("${{{inner}}}")));
             }
-            let value = (ctx.lookup_var)(&name).filter(|v| !v.is_empty());
-            if let Some(val) = value {
-                return Ok(Some(val));
+            match param {
+                Parameter::Default { fallback, .. } => {
+                    let value = (ctx.lookup_var)(&name).unwrap_or_default();
+                    if !value.is_empty() {
+                        return Ok(Some(value));
+                    }
+                    if let Some(fallback) = fallback {
+                        return Ok(Some(expand_token(&fallback, ctx)?));
+                    }
+                    Ok(Some(String::new()))
+                }
+                Parameter::Pattern { op, pattern, .. } => {
+                    let value = (ctx.lookup_var)(&name).unwrap_or_default();
+                    let pattern = strip_markers(&pattern);
+                    if pattern.is_empty() {
+                        return Ok(Some(value));
+                    }
+                    let stripped = match op {
+                        ParamOp::Prefix => remove_prefix_pattern(&value, &pattern)?,
+                        ParamOp::Suffix => remove_suffix_pattern(&value, &pattern)?,
+                    };
+                    Ok(Some(stripped))
+                }
+                Parameter::Subst {
+                    pattern,
+                    replacement,
+                    ..
+                } => {
+                    let value = (ctx.lookup_var)(&name).unwrap_or_default();
+                    let pattern = strip_markers(&pattern);
+                    let replacement = strip_markers(&replacement);
+                    if pattern.is_empty() {
+                        return Ok(Some(value));
+                    }
+                    let replaced = replace_first_pattern(&value, &pattern, &replacement)?;
+                    Ok(Some(replaced))
+                }
+                Parameter::Array { index, length, .. } => {
+                    let arr = (ctx.lookup_array)(&name);
+                    if let Some(value) = expand_array_ref(&name, index.as_deref(), length, ctx, arr) {
+                        return Ok(Some(value));
+                    }
+                    Ok(Some(String::new()))
+                }
+                Parameter::Simple { length, .. } => {
+                    if length {
+                        let value = (ctx.lookup_var)(&name).unwrap_or_default();
+                        return Ok(Some(value.chars().count().to_string()));
+                    }
+                    Ok(Some((ctx.lookup_var)(&name).unwrap_or_default()))
+                }
             }
-            if let Some(fallback) = fallback {
-                return Ok(Some(expand_token(&fallback, ctx)?));
-            }
-            Ok(Some(String::new()))
         }
         Some(ch) if is_var_start(ch) => {
             let mut name = String::new();
@@ -200,12 +290,201 @@ where
     }
 }
 
-fn split_parameter(input: &str) -> Result<(&str, Option<String>), String> {
-    if let Some((name, fallback)) = input.split_once(":-") {
-        Ok((name, Some(fallback.to_string())))
-    } else {
-        Ok((input, None))
+enum ParamOp {
+    Prefix,
+    Suffix,
+}
+
+enum Parameter {
+    Simple { name: String, length: bool },
+    Default { name: String, fallback: Option<String> },
+    Pattern { name: String, op: ParamOp, pattern: String },
+    Subst {
+        name: String,
+        pattern: String,
+        replacement: String,
+    },
+    Array { name: String, index: Option<String>, length: bool },
+}
+
+impl Parameter {
+    fn name(&self) -> &str {
+        match self {
+            Parameter::Simple { name, .. } => name,
+            Parameter::Default { name, .. } => name,
+            Parameter::Pattern { name, .. } => name,
+            Parameter::Subst { name, .. } => name,
+            Parameter::Array { name, .. } => name,
+        }
     }
+}
+
+fn parse_parameter(input: &str) -> Result<Parameter, String> {
+    if let Some((name, fallback)) = input.split_once(":-") {
+        return Ok(Parameter::Default {
+            name: name.to_string(),
+            fallback: Some(fallback.to_string()),
+        });
+    }
+
+    let (length, inner) = if let Some(rest) = input.strip_prefix('#') {
+        (true, rest)
+    } else {
+        (false, input)
+    };
+
+    if let Some((name, index)) = parse_array_ref(inner) {
+        return Ok(Parameter::Array {
+            name,
+            index,
+            length,
+        });
+    }
+
+    if let Some((name, pattern, replacement)) = parse_subst(inner) {
+        return Ok(Parameter::Subst {
+            name,
+            pattern,
+            replacement,
+        });
+    }
+
+    if let Some((name, pattern)) = inner.split_once('#') {
+        return Ok(Parameter::Pattern {
+            name: name.to_string(),
+            op: ParamOp::Prefix,
+            pattern: pattern.to_string(),
+        });
+    }
+
+    if let Some((name, pattern)) = inner.split_once('%') {
+        return Ok(Parameter::Pattern {
+            name: name.to_string(),
+            op: ParamOp::Suffix,
+            pattern: pattern.to_string(),
+        });
+    }
+
+    Ok(Parameter::Simple {
+        name: inner.to_string(),
+        length,
+    })
+}
+
+fn parse_array_ref(input: &str) -> Option<(String, Option<String>)> {
+    let open = input.find('[')?;
+    if !input.ends_with(']') {
+        return None;
+    }
+    let name = &input[..open];
+    let inner = &input[open + 1..input.len() - 1];
+    let index = if inner.is_empty() {
+        None
+    } else {
+        Some(inner.to_string())
+    };
+    Some((name.to_string(), index))
+}
+
+fn parse_subst(input: &str) -> Option<(String, String, String)> {
+    let mut parts = input.splitn(3, '/');
+    let name = parts.next()?.to_string();
+    let pattern = parts.next()?.to_string();
+    let replacement = parts.next().unwrap_or("").to_string();
+    if name.is_empty() {
+        return None;
+    }
+    Some((name, pattern, replacement))
+}
+
+fn expand_array_ref(
+    name: &str,
+    index: Option<&str>,
+    length: bool,
+    ctx: &ExpansionContext<'_>,
+    array: Option<Vec<String>>,
+) -> Option<String> {
+    let values = array?;
+    match index {
+        Some("@") | Some("*") => {
+            if length {
+                return Some(values.len().to_string());
+            }
+            let ifs = (ctx.lookup_var)("IFS").unwrap_or_else(|| " \t\n".to_string());
+            let sep = ifs.chars().next().unwrap_or(' ');
+            return Some(values.join(&sep.to_string()));
+        }
+        Some(idx_str) => {
+            let idx = idx_str.parse::<usize>().ok()?;
+            let value = values.get(idx).cloned().unwrap_or_default();
+            if length {
+                return Some(value.chars().count().to_string());
+            }
+            return Some(value);
+        }
+        None => {
+            if length {
+                return Some(values.len().to_string());
+            }
+            let ifs = (ctx.lookup_var)("IFS").unwrap_or_else(|| " \t\n".to_string());
+            let sep = ifs.chars().next().unwrap_or(' ');
+            return Some(values.join(&sep.to_string()));
+        }
+    }
+}
+
+fn replace_first_pattern(value: &str, pattern: &str, replacement: &str) -> Result<String, String> {
+    let matcher = Pattern::new(pattern).map_err(|err| format!("invalid pattern: {err}"))?;
+    let indices: Vec<usize> = value
+        .char_indices()
+        .map(|(idx, _)| idx)
+        .chain(std::iter::once(value.len()))
+        .collect();
+    for (i, &start) in indices.iter().enumerate() {
+        for &end in indices.iter().skip(i) {
+            let slice = &value[start..end];
+            if matcher.matches(slice) {
+                let mut out = String::new();
+                out.push_str(&value[..start]);
+                out.push_str(replacement);
+                out.push_str(&value[end..]);
+                return Ok(out);
+            }
+        }
+    }
+    Ok(value.to_string())
+}
+
+fn remove_prefix_pattern(value: &str, pattern: &str) -> Result<String, String> {
+    let matcher = Pattern::new(pattern).map_err(|err| format!("invalid pattern: {err}"))?;
+    let indices: Vec<usize> = value
+        .char_indices()
+        .map(|(idx, _)| idx)
+        .chain(std::iter::once(value.len()))
+        .collect();
+    for &end in &indices {
+        let prefix = &value[..end];
+        if matcher.matches(prefix) {
+            return Ok(value[end..].to_string());
+        }
+    }
+    Ok(value.to_string())
+}
+
+fn remove_suffix_pattern(value: &str, pattern: &str) -> Result<String, String> {
+    let matcher = Pattern::new(pattern).map_err(|err| format!("invalid pattern: {err}"))?;
+    let indices: Vec<usize> = value
+        .char_indices()
+        .map(|(idx, _)| idx)
+        .chain(std::iter::once(value.len()))
+        .collect();
+    for &start in indices.iter().rev() {
+        let suffix = &value[start..];
+        if matcher.matches(suffix) {
+            return Ok(value[..start].to_string());
+        }
+    }
+    Ok(value.to_string())
 }
 
 fn is_var_start(ch: char) -> bool {
@@ -451,6 +730,7 @@ fn split_top_level_ranges(inner: &str) -> Option<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::parse::strip_markers;
     use std::env;
 
     fn with_env_var<F: FnOnce()>(key: &str, value: &str, f: F) {
@@ -466,6 +746,23 @@ mod tests {
     fn ctx_no_subst() -> ExpansionContext<'static> {
         ExpansionContext {
             lookup_var: Box::new(|name| env::var(name).ok()),
+            lookup_array: Box::new(|_| None),
+            command_subst: Box::new(|_| Ok(String::new())),
+            positional: &[],
+            strict: true,
+        }
+    }
+
+    fn ctx_with_array(name: &'static str, values: Vec<String>) -> ExpansionContext<'static> {
+        ExpansionContext {
+            lookup_var: Box::new(|_| None),
+            lookup_array: Box::new(move |key| {
+                if key == name {
+                    Some(values.clone())
+                } else {
+                    None
+                }
+            }),
             command_subst: Box::new(|_| Ok(String::new())),
             positional: &[],
             strict: true,
@@ -487,6 +784,49 @@ mod tests {
     }
 
     #[test]
+    fn expand_parameter_prefix_pattern() {
+        let ctx = ctx_no_subst();
+        let key = "CS_TEST_PATTERN";
+        with_env_var(key, "foobar", || {
+            let token = format!("${{{key}#foo*}}");
+            assert_eq!(expand_token(&token, &ctx).unwrap(), "bar");
+        });
+    }
+
+    #[test]
+    fn expand_parameter_suffix_pattern() {
+        let ctx = ctx_no_subst();
+        let key = "CS_TEST_PATTERN";
+        with_env_var(key, "foobar", || {
+            let token = format!("${{{key}%*bar}}");
+            assert_eq!(expand_token(&token, &ctx).unwrap(), "foo");
+        });
+    }
+
+    #[test]
+    fn expand_array_index() {
+        let ctx = ctx_with_array("arr", vec!["a".into(), "b".into(), "c".into()]);
+        assert_eq!(expand_token("${arr[1]}", &ctx).unwrap(), "b");
+    }
+
+    #[test]
+    fn expand_array_length() {
+        let ctx = ctx_with_array("arr", vec!["a".into(), "bb".into()]);
+        assert_eq!(expand_token("${#arr[@]}", &ctx).unwrap(), "2");
+        assert_eq!(expand_token("${#arr[1]}", &ctx).unwrap(), "2");
+    }
+
+    #[test]
+    fn expand_parameter_subst_first_match() {
+        let ctx = ctx_no_subst();
+        let key = "CS_TEST_SUBST";
+        with_env_var(key, "foo-bar-baz", || {
+            let token = format!("${{{key}/-/_}}");
+            assert_eq!(expand_token(&token, &ctx).unwrap(), "foo_bar-baz");
+        });
+    }
+
+    #[test]
     fn escaped_operator_is_literal() {
         let ctx = ctx_no_subst();
         let token = format!("foo{ESCAPE_MARKER}|bar");
@@ -494,13 +834,29 @@ mod tests {
     }
 
     #[test]
-    fn ifs_is_not_used_for_splitting() {
+    fn ifs_splits_unquoted_fields() {
         let ctx = ctx_no_subst();
         let key = "CS_TEST_IFS";
-        with_env_var(key, "a:b", || {
-            let tokens = vec![format!("${key}")];
-            let expanded = expand_tokens(tokens, &ctx).unwrap();
-            assert_eq!(expanded, vec!["a:b"]);
+        with_env_var("IFS", ":", || {
+            with_env_var(key, "a:b:c", || {
+                let tokens = vec![format!("${key}")];
+                let expanded = expand_tokens(tokens, &ctx).unwrap();
+                assert_eq!(expanded, vec!["a", "b", "c"]);
+            });
+        });
+    }
+
+    #[test]
+    fn ifs_does_not_split_quoted_segments() {
+        let ctx = ctx_no_subst();
+        let key = "CS_TEST_IFS";
+        with_env_var("IFS", ":", || {
+            with_env_var(key, "a:b", || {
+                let tokens = vec![format!("\"${key}\"")];
+                let expanded = expand_tokens(tokens, &ctx).unwrap();
+                assert_eq!(strip_markers(&expanded[0]), "a:b");
+                assert_eq!(expanded.len(), 1);
+            });
         });
     }
 

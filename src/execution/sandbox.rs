@@ -132,10 +132,11 @@ pub(crate) fn apply_sandbox(command: &mut Command, options: &SandboxOptions) -> 
                 Ok(())
             }
             SandboxBackend::Native => {
-                let program = command.get_program().to_os_string();
-                let args: Vec<_> = command.get_args().map(|arg| arg.to_os_string()).collect();
-                set_pre_exec(command, move || native_sandbox_exec(&program, &args));
-                Ok(())
+                let _ = command;
+                Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "native sandbox backend not implemented; use bubblewrap or disable sandbox",
+                ))
             }
         }
     }
@@ -174,10 +175,29 @@ fn execvp_os(program: &std::ffi::OsStr, args: &[std::ffi::OsString]) -> io::Resu
 }
 
 #[cfg(feature = "sandbox")]
+#[allow(dead_code)]
 fn native_sandbox_exec(
     program: &std::ffi::OsString,
     args: &[std::ffi::OsString],
 ) -> io::Result<()> {
     // Placeholder for advanced native sandbox setup.
     execvp_os(program, args)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn native_backend_is_explicitly_unsupported() {
+        let options = SandboxOptions {
+            trace: false,
+            backend: SandboxBackend::Native,
+            bubblewrap_path: None,
+            bubblewrap_args: Vec::new(),
+        };
+        let mut command = Command::new("true");
+        let err = apply_sandbox(&mut command, &options).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::Unsupported);
+    }
 }

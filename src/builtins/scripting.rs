@@ -2,6 +2,7 @@ use std::io;
 use std::sync::Arc;
 
 use crate::expansion::{expand_globs, expand_tokens};
+use crate::process_subst::{apply_process_subst, FdGuard, ProcessSubstResult};
 use crate::parse::{split_sequence, token_str, SeqOp};
 use crate::utils::is_valid_var_name;
 use crate::{build_expansion_context, execute_segment, trace_tokens, ShellState};
@@ -11,6 +12,7 @@ pub(crate) fn execute_script_tokens(state: &mut ShellState, tokens: Vec<String>)
         Arc::clone(&state.fg_pgid),
         state.trace,
         state.sandbox.clone(),
+        state.arrays.clone(),
         &[],
         true,
     );
@@ -29,6 +31,16 @@ pub(crate) fn execute_script_tokens(state: &mut ShellState, tokens: Vec<String>)
     if expanded.is_empty() {
         return Ok(());
     }
+
+    let ProcessSubstResult { tokens: expanded, keep_fds } = apply_process_subst(
+        expanded,
+        Arc::clone(&state.fg_pgid),
+        state.trace,
+        state.sandbox.clone(),
+        state.arrays.clone(),
+        true,
+    )?;
+    let _fd_guard = FdGuard(keep_fds);
 
     let expanded = match expand_globs(expanded) {
         Ok(v) => v,
@@ -76,68 +88,84 @@ pub(crate) fn execute_function(
     func_tokens: Vec<String>,
     args: &[String],
 ) -> io::Result<()> {
+    state.push_local_scope();
     let ctx = build_expansion_context(
         Arc::clone(&state.fg_pgid),
         state.trace,
         state.sandbox.clone(),
+        state.arrays.clone(),
         args,
         true,
     );
+    let result = (|| {
     let expanded = match expand_tokens(func_tokens, &ctx) {
         Ok(v) => v,
         Err(msg) => {
             state.last_status = 2;
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("parse error: {msg}"),
-            ));
-        }
-    };
+                    format!("parse error: {msg}"),
+                ));
+            }
+        };
     trace_tokens(state, "function expanded tokens", &expanded);
 
     if expanded.is_empty() {
         return Ok(());
     }
 
+    let ProcessSubstResult { tokens: expanded, keep_fds } = apply_process_subst(
+        expanded,
+        Arc::clone(&state.fg_pgid),
+        state.trace,
+        state.sandbox.clone(),
+        state.arrays.clone(),
+        true,
+    )?;
+    let _fd_guard = FdGuard(keep_fds);
+
     let expanded = match expand_globs(expanded) {
         Ok(v) => v,
         Err(msg) => {
             state.last_status = 2;
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("parse error: {msg}"),
-            ));
-        }
-    };
-    trace_tokens(state, "function globbed tokens", &expanded);
-
-    if expanded.is_empty() {
-        return Ok(());
-    }
-
-    let segments = match split_sequence(expanded) {
-        Ok(v) => v,
-        Err(msg) => {
-            state.last_status = 2;
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("parse error: {msg}"),
-            ));
-        }
-    };
-
-    for segment in segments {
-        let should_run = match segment.op {
-            SeqOp::Always => true,
-            SeqOp::And => state.last_status == 0,
-            SeqOp::Or => state.last_status != 0,
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("parse error: {msg}"),
+                ));
+            }
         };
-        if should_run {
-            execute_segment(state, segment.tokens, &segment.display)?;
-        }
-    }
+        trace_tokens(state, "function globbed tokens", &expanded);
 
-    Ok(())
+        if expanded.is_empty() {
+            return Ok(());
+        }
+
+        let segments = match split_sequence(expanded) {
+            Ok(v) => v,
+            Err(msg) => {
+                state.last_status = 2;
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("parse error: {msg}"),
+                ));
+            }
+        };
+
+        for segment in segments {
+            let should_run = match segment.op {
+                SeqOp::Always => true,
+                SeqOp::And => state.last_status == 0,
+                SeqOp::Or => state.last_status != 0,
+            };
+            if should_run {
+                execute_segment(state, segment.tokens, &segment.display)?;
+            }
+        }
+
+        Ok(())
+    })();
+    state.pop_local_scope();
+    result
 }
 
 pub(crate) fn is_function_def_start(tokens: &[String]) -> bool {

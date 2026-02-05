@@ -53,6 +53,12 @@ pub struct BuiltinPipeResult {
     pub pipefail_status: i32,
 }
 
+pub struct BuiltinPipeCaptureResult {
+    pub output: String,
+    pub status_code: i32,
+    pub pipefail_status: i32,
+}
+
 pub fn run_pipeline_capture(
     pipeline: &[CommandSpec],
     fg_pgid: &Arc<AtomicI32>,
@@ -265,6 +271,79 @@ where
     }
 
     Ok(BuiltinPipeResult {
+        status_code,
+        pipefail_status,
+    })
+}
+
+pub fn builtin_pipe_capture<F, G>(
+    pipeline: &[CommandSpec],
+    mut is_builtin: F,
+    mut run_builtin: G,
+    trace: bool,
+    sandbox: &SandboxConfig,
+) -> io::Result<BuiltinPipeCaptureResult>
+where
+    F: FnMut(&CommandSpec) -> bool,
+    G: FnMut(&CommandSpec, Option<&mut dyn Read>) -> io::Result<CaptureResult>,
+{
+    let mut input: Option<String> = None;
+    let mut output = String::new();
+    let mut status_code = 0;
+    let mut pipefail_status = 0;
+
+    for (idx, cmd) in pipeline.iter().enumerate() {
+        let last = idx + 1 == pipeline.len();
+        if is_builtin(cmd) {
+            let mut stdin =
+                command_stdin_reader(cmd, input.as_deref().map(|data| data.as_bytes()))?;
+            let result = run_builtin(cmd, stdin.as_deref_mut())?;
+            status_code = result.status_code;
+            if result.status_code != 0 {
+                pipefail_status = result.status_code;
+            }
+            if last {
+                if cmd.stdout.is_some() {
+                    write_command_output(cmd, &result.output)?;
+                    output.clear();
+                } else {
+                    output = result.output;
+                }
+            } else if cmd.stdout.is_some() {
+                write_command_output(cmd, &result.output)?;
+                input = None;
+            } else {
+                input = Some(result.output);
+            }
+        } else {
+            let capture_output = cmd.stdout.is_none();
+            let piped_input = if input_redirection_count(cmd) == 0 {
+                input.take()
+            } else {
+                None
+            };
+            let result =
+                run_external_capture(cmd, piped_input.as_deref(), capture_output, trace, sandbox)?;
+            status_code = result.status_code;
+            if result.status_code != 0 {
+                pipefail_status = result.status_code;
+            }
+            if last {
+                if capture_output {
+                    output = result.output;
+                } else {
+                    output.clear();
+                }
+            } else if capture_output {
+                input = Some(result.output);
+            } else {
+                input = None;
+            }
+        }
+    }
+
+    Ok(BuiltinPipeCaptureResult {
+        output,
         status_code,
         pipefail_status,
     })

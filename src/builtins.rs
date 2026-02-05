@@ -7,6 +7,8 @@ pub(crate) use scripting::execute_function;
 
 use std::fmt::Write;
 use std::io::{self, Read};
+use std::path::Path;
+use std::{env, fs};
 
 use crate::completions::suggest_command;
 use crate::error::{ErrorKind, ShellError};
@@ -23,7 +25,8 @@ use config_cmds::{
     handle_source,
 };
 use control_flow::{
-    execute_case, execute_for, execute_if, execute_while, is_case_start, is_for_start, is_if_start,
+    execute_brace_group, execute_case, execute_for, execute_if, execute_select, execute_while,
+    is_brace_group_start, is_case_start, is_for_start, is_if_start, is_select_start,
     is_while_start, read_compound_tokens, CompoundKind,
 };
 use job_cmds::{handle_bg, handle_fg};
@@ -43,6 +46,11 @@ pub fn is_builtin(cmd: Option<&str>) -> bool {
                 | "echo"
                 | "true"
                 | "false"
+                | "unset"
+                | "local"
+                | "getopts"
+                | "type"
+                | "fc"
                 | "abbr"
                 | "complete"
                 | "set_color"
@@ -58,6 +66,11 @@ pub fn try_execute_compound(
     tokens: &[String],
     display: &str,
 ) -> io::Result<Option<bool>> {
+    if is_brace_group_start(tokens) {
+        let tokens = read_compound_tokens(state, tokens.to_vec(), CompoundKind::Brace)?;
+        execute_brace_group(state, tokens, display)?;
+        return Ok(Some(true));
+    }
     if is_if_start(tokens) {
         let tokens = read_compound_tokens(state, tokens.to_vec(), CompoundKind::If)?;
         execute_if(state, tokens, display)?;
@@ -71,6 +84,11 @@ pub fn try_execute_compound(
     if is_for_start(tokens) {
         let tokens = read_compound_tokens(state, tokens.to_vec(), CompoundKind::For)?;
         execute_for(state, tokens, display)?;
+        return Ok(Some(true));
+    }
+    if is_select_start(tokens) {
+        let tokens = read_compound_tokens(state, tokens.to_vec(), CompoundKind::Select)?;
+        execute_select(state, tokens, display)?;
         return Ok(Some(true));
     }
     if is_case_start(tokens) {
@@ -244,7 +262,7 @@ fn execute_builtin_with_output(
             }
             let _ = writeln!(
                 output,
-                "Built-ins: cd [dir], pwd, jobs, fg [id], bg [id], help, exit [code], echo, true, false, abbr, complete"
+                "Built-ins: cd [dir], pwd, jobs, fg [id], bg [id], help, exit [code], echo, true, false, unset, local, getopts, type, fc, abbr, complete"
             );
             let _ = writeln!(
                 output,
@@ -272,9 +290,67 @@ fn execute_builtin_with_output(
             let _ = writeln!(output, "Colors: set_color key value (or ~/.minishell_colors).");
             let _ = writeln!(
                 output,
-                "Expansion order: quotes/escapes -> command substitution -> vars/tilde -> glob (no IFS splitting)."
+                "Expansion order: quotes/escapes -> command substitution -> vars/tilde -> IFS splitting -> glob."
             );
             state.last_status = 0;
+        }
+        Some("unset") => {
+            if args.len() < 2 {
+                state.last_status = 0;
+                return Ok(state.last_status);
+            }
+            let mut failed = false;
+            for name in &args[1..] {
+                if let Some((arr, idx)) = parse_array_unset(name) {
+                    state.unset_array_elem(&arr, idx);
+                    continue;
+                }
+                if !crate::utils::is_valid_var_name(name) {
+                    if let Some(arr_name) = name.strip_suffix("[]") {
+                        if crate::utils::is_valid_var_name(arr_name) {
+                            state.unset_array(arr_name);
+                            continue;
+                        }
+                    }
+                    eprintln!("unset: invalid variable name '{name}'");
+                    failed = true;
+                    continue;
+                }
+                state.unset_var(name);
+            }
+            state.last_status = if failed { 1 } else { 0 };
+        }
+        Some("local") => {
+            if args.len() < 2 {
+                state.last_status = 0;
+                return Ok(state.last_status);
+            }
+            let mut failed = false;
+            for entry in &args[1..] {
+                let (name, value) = match entry.split_once('=') {
+                    Some((name, value)) => (name, value),
+                    None => (entry.as_str(), ""),
+                };
+                if !crate::utils::is_valid_var_name(name) {
+                    eprintln!("local: invalid variable name '{name}'");
+                    failed = true;
+                    continue;
+                }
+                if let Err(err) = state.set_local_var(name, value) {
+                    eprintln!("{err}");
+                    failed = true;
+                }
+            }
+            state.last_status = if failed { 1 } else { 0 };
+        }
+        Some("getopts") => {
+            state.last_status = handle_getopts(args)?;
+        }
+        Some("type") => {
+            handle_type(state, args, output)?;
+        }
+        Some("fc") => {
+            handle_fc(state, args, output)?;
         }
         Some("abbr") => {
             handle_abbr(state, args, output)?;
@@ -353,17 +429,41 @@ pub fn execute_builtin_substitution(pipeline: &[CommandSpec]) -> Result<(String,
     if pipeline.len() != 1 {
         return Err("pipes only work with external commands".to_string());
     }
-    let args = &pipeline[0].args;
+    let result = execute_builtin_substitution_capture(&pipeline[0], None)?;
+    Ok((result.output, result.status_code))
+}
+
+pub fn execute_builtin_substitution_capture(
+    cmd: &CommandSpec,
+    _stdin: Option<&mut dyn Read>,
+) -> Result<CaptureResult, String> {
+    let args = &cmd.args;
     match args.first().map(String::as_str) {
         Some("pwd") => {
             let cwd = std::env::current_dir().unwrap_or_else(|_| "/".into());
-            Ok((cwd.display().to_string(), 0))
+            Ok(CaptureResult {
+                output: cwd.display().to_string(),
+                status_code: 0,
+            })
         }
-        Some("help") => Ok((
-            "Built-ins: cd [dir], pwd, jobs, fg [id], bg [id], help, exit [code], echo, true, false, abbr, complete"
+        Some("help") => Ok(CaptureResult {
+            output: "Built-ins: cd [dir], pwd, jobs, fg [id], bg [id], help, exit [code], echo, true, false, unset, local, getopts, type, fc, abbr, complete"
                 .to_string(),
-            0,
-        )),
+            status_code: 0,
+        }),
+        Some("echo") => Ok(CaptureResult {
+            output: format!("{}\n", args[1..].join(" ")),
+            status_code: 0,
+        }),
+        Some("type") => execute_type_substitution(args),
+        Some("true") => Ok(CaptureResult {
+            output: String::new(),
+            status_code: 0,
+        }),
+        Some("false") => Ok(CaptureResult {
+            output: String::new(),
+            status_code: 1,
+        }),
         Some("cd") => Err(ShellError::new(
             ErrorKind::Execution,
             "cd is not supported in command substitution".to_string(),
@@ -403,4 +503,352 @@ pub fn execute_builtin_substitution(pipeline: &[CommandSpec]) -> Result<(String,
         .with_context("Only external commands can be used in $(...) substitution")
         .into()),
     }
+}
+
+fn handle_getopts(args: &[String]) -> io::Result<i32> {
+    if args.len() < 3 {
+        eprintln!("usage: getopts optstring name [args...]");
+        return Ok(2);
+    }
+    let optstring = &args[1];
+    let name = &args[2];
+    let optargs = &args[3..];
+    let mut optind = env::var("OPTIND")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(1);
+    if optind == 0 {
+        optind = 1;
+    }
+    let mut optpos = env::var("OPTPOS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(1);
+
+    let mut current = if optind > optargs.len() {
+        None
+    } else {
+        Some(optargs[optind - 1].as_str())
+    };
+
+    if let Some(arg) = current {
+        if arg == "--" {
+            optind += 1;
+            env::set_var("OPTIND", optind.to_string());
+            env::set_var("OPTPOS", "1");
+            env::set_var(name, "?");
+            return Ok(1);
+        }
+    }
+
+    while let Some(arg) = current {
+        if !arg.starts_with('-') || arg == "-" {
+            env::set_var(name, "?");
+            return Ok(1);
+        }
+        let chars: Vec<char> = arg[1..].chars().collect();
+        if optpos > chars.len() {
+            optind += 1;
+            optpos = 1;
+            current = if optind > optargs.len() {
+                None
+            } else {
+                Some(optargs[optind - 1].as_str())
+            };
+            continue;
+        }
+        let opt = chars[optpos - 1];
+        optpos += 1;
+        let opt_entry = optstring.find(opt);
+        let needs_arg = opt_entry
+            .and_then(|idx| optstring.as_bytes().get(idx + 1))
+            .map(|b| *b == b':')
+            .unwrap_or(false);
+        if opt_entry.is_none() || opt == ':' {
+            env::set_var(name, if optstring.starts_with(':') { ":" } else { "?" });
+            env::set_var("OPTARG", opt.to_string());
+            env::set_var("OPTIND", optind.to_string());
+            env::set_var("OPTPOS", optpos.to_string());
+            return Ok(1);
+        }
+        if needs_arg {
+            if optpos <= chars.len() {
+                let arg_val: String = chars[optpos - 1..].iter().collect();
+                optind += 1;
+                optpos = 1;
+                env::set_var("OPTARG", arg_val);
+            } else if optind < optargs.len() {
+                optind += 1;
+                let arg_val = optargs[optind - 1].clone();
+                optind += 1;
+                optpos = 1;
+                env::set_var("OPTARG", arg_val);
+            } else {
+                env::set_var(name, if optstring.starts_with(':') { ":" } else { "?" });
+                env::set_var("OPTARG", opt.to_string());
+                env::set_var("OPTIND", optind.to_string());
+                env::set_var("OPTPOS", optpos.to_string());
+                return Ok(1);
+            }
+        } else {
+            env::remove_var("OPTARG");
+        }
+        env::set_var(name, opt.to_string());
+        env::set_var("OPTIND", optind.to_string());
+        env::set_var("OPTPOS", optpos.to_string());
+        return Ok(0);
+    }
+
+    env::set_var(name, "?");
+    Ok(1)
+}
+
+fn handle_type(state: &ShellState, args: &[String], output: &mut String) -> io::Result<()> {
+    if args.len() < 2 {
+        eprintln!("usage: type [-a|-t] name...");
+        state.last_status = 2;
+        return Ok(());
+    }
+    let mut show_all = false;
+    let mut type_only = false;
+    let mut idx = 1usize;
+    while idx < args.len() {
+        match args[idx].as_str() {
+            "-a" => show_all = true,
+            "-t" => type_only = true,
+            "--" => {
+                idx += 1;
+                break;
+            }
+            _ if args[idx].starts_with('-') => {
+                eprintln!("type: unsupported option '{}'", args[idx]);
+                state.last_status = 2;
+                return Ok(());
+            }
+            _ => break,
+        }
+        idx += 1;
+    }
+    if idx >= args.len() {
+        state.last_status = 2;
+        return Ok(());
+    }
+    let mut ok = true;
+    for name in &args[idx..] {
+        let mut entries = Vec::new();
+        if let Some(value) = state.aliases.get(name) {
+            entries.push(("alias", format!("{}={}", name, value.join(" "))));
+        }
+        if state.functions.contains_key(name) {
+            entries.push(("function", name.to_string()));
+        }
+        if is_builtin(Some(name)) || name == "set" {
+            entries.push(("builtin", name.to_string()));
+        }
+        if let Some(path) = find_in_path(name) {
+            entries.push(("file", path));
+        }
+        if entries.is_empty() {
+            ok = false;
+            eprintln!("type: {name} not found");
+            continue;
+        }
+        if !show_all {
+            entries.truncate(1);
+        }
+        for (kind, detail) in entries {
+            if type_only {
+                let _ = writeln!(output, "{kind}");
+            } else {
+                match kind {
+                    "alias" => {
+                        let _ = writeln!(output, "{name} is an alias for {detail}");
+                    }
+                    "function" => {
+                        let _ = writeln!(output, "{name} is a shell function");
+                    }
+                    "builtin" => {
+                        let _ = writeln!(output, "{name} is a shell builtin");
+                    }
+                    "file" => {
+                        let _ = writeln!(output, "{name} is {detail}");
+                    }
+                    _ => {
+                        let _ = writeln!(output, "{name} is {detail}");
+                    }
+                }
+            }
+        }
+    }
+    state.last_status = if ok { 0 } else { 1 };
+    Ok(())
+}
+
+fn handle_fc(state: &mut ShellState, args: &[String], output: &mut String) -> io::Result<()> {
+    let mut list_only = false;
+    let mut no_numbers = false;
+    let mut reverse = false;
+    let mut idx = 1usize;
+    while idx < args.len() {
+        match args[idx].as_str() {
+            "-l" => list_only = true,
+            "-n" => no_numbers = true,
+            "-r" => reverse = true,
+            "--" => {
+                idx += 1;
+                break;
+            }
+            _ if args[idx].starts_with('-') => {
+                eprintln!("fc: unsupported option '{}'", args[idx]);
+                state.last_status = 2;
+                return Ok(());
+            }
+            _ => break,
+        }
+        idx += 1;
+    }
+
+    if !list_only {
+        list_only = true;
+    }
+
+    let history_len = state.editor.history().len();
+    let mut start = history_len.saturating_sub(16);
+    let mut end = history_len.saturating_sub(1);
+    if idx < args.len() {
+        if let Ok(val) = args[idx].parse::<isize>() {
+            start = resolve_history_index(history_len, val);
+        } else {
+            eprintln!("fc: invalid history index");
+            state.last_status = 2;
+            return Ok(());
+        }
+        idx += 1;
+    }
+    if idx < args.len() {
+        if let Ok(val) = args[idx].parse::<isize>() {
+            end = resolve_history_index(history_len, val);
+        } else {
+            eprintln!("fc: invalid history index");
+            state.last_status = 2;
+            return Ok(());
+        }
+    }
+
+    if start > end {
+        std::mem::swap(&mut start, &mut end);
+    }
+
+    let range: Vec<usize> = (start..=end).collect();
+    let iter: Box<dyn Iterator<Item = usize>> = if reverse {
+        Box::new(range.into_iter().rev())
+    } else {
+        Box::new(range.into_iter())
+    };
+    for i in iter {
+        if let Some(entry) = state.editor.history().get(i) {
+            if no_numbers {
+                let _ = writeln!(output, "{entry}");
+            } else {
+                let _ = writeln!(output, "{i} {entry}");
+            }
+        }
+    }
+    state.last_status = 0;
+    Ok(())
+}
+
+fn resolve_history_index(history_len: usize, value: isize) -> usize {
+    if history_len == 0 {
+        return 0;
+    }
+    if value < 0 {
+        let idx = history_len as isize + value;
+        if idx < 0 {
+            0
+        } else {
+            idx as usize
+        }
+    } else {
+        let idx = value as usize;
+        if idx >= history_len {
+            history_len.saturating_sub(1)
+        } else {
+            idx
+        }
+    }
+}
+
+fn find_in_path(name: &str) -> Option<String> {
+    if name.contains('/') {
+        let path = Path::new(name);
+        if path.exists() {
+            return Some(name.to_string());
+        }
+        return None;
+    }
+    let path_var = env::var("PATH").ok()?;
+    for part in path_var.split(':') {
+        if part.is_empty() {
+            continue;
+        }
+        let candidate = Path::new(part).join(name);
+        if candidate.is_file() && is_executable(&candidate) {
+            return Some(candidate.display().to_string());
+        }
+    }
+    None
+}
+
+fn is_executable(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(meta) = fs::metadata(path) {
+            return meta.is_file() && (meta.permissions().mode() & 0o111 != 0);
+        }
+        false
+    }
+    #[cfg(not(unix))]
+    {
+        path.is_file()
+    }
+}
+
+fn parse_array_unset(input: &str) -> Option<(String, usize)> {
+    let open = input.find('[')?;
+    if !input.ends_with(']') {
+        return None;
+    }
+    let name = input[..open].to_string();
+    let idx_str = &input[open + 1..input.len() - 1];
+    let idx = idx_str.parse::<usize>().ok()?;
+    Some((name, idx))
+}
+
+fn execute_type_substitution(args: &[String]) -> Result<CaptureResult, String> {
+    if args.len() < 2 {
+        return Err(ShellError::new(
+            ErrorKind::Execution,
+            "type: missing name".to_string(),
+        )
+        .into());
+    }
+    let mut output = String::new();
+    let mut ok = true;
+    for name in &args[1..] {
+        if is_builtin(Some(name)) || name == "set" {
+            output.push_str(&format!("{name} is a shell builtin\n"));
+            continue;
+        }
+        if let Some(path) = find_in_path(name) {
+            output.push_str(&format!("{name} is {path}\n"));
+            continue;
+        }
+        ok = false;
+    }
+    Ok(CaptureResult {
+        output,
+        status_code: if ok { 0 } else { 1 },
+    })
 }

@@ -6,6 +6,7 @@ use glob::Pattern;
 use crate::expansion::{expand_globs, expand_tokens};
 use crate::io_helpers::read_input_line;
 use crate::parse::{parse_line, token_str, OPERATOR_TOKEN_MARKER};
+use crate::process_subst::{apply_process_subst, FdGuard, ProcessSubstResult};
 use crate::{build_expansion_context, trace_tokens, ShellState};
 
 use super::scripting::execute_script_tokens;
@@ -15,8 +16,10 @@ pub(crate) enum CompoundKind {
     If,
     While,
     For,
+    Select,
     Case,
     Function,
+    Brace,
 }
 
 pub(crate) fn is_if_start(tokens: &[String]) -> bool {
@@ -31,8 +34,16 @@ pub(crate) fn is_for_start(tokens: &[String]) -> bool {
     tokens.first().map(String::as_str) == Some("for")
 }
 
+pub(crate) fn is_select_start(tokens: &[String]) -> bool {
+    tokens.first().map(String::as_str) == Some("select")
+}
+
 pub(crate) fn is_case_start(tokens: &[String]) -> bool {
     tokens.first().map(String::as_str) == Some("case")
+}
+
+pub(crate) fn is_brace_group_start(tokens: &[String]) -> bool {
+    tokens.first().map(String::as_str) == Some("{")
 }
 
 pub(crate) fn read_compound_tokens(
@@ -68,6 +79,7 @@ fn needs_more_compound(tokens: &[String], kind: CompoundKind) -> bool {
     let mut while_count = 0i32;
     let mut for_count = 0i32;
     let mut case_count = 0i32;
+    let mut select_count = 0i32;
     // Function bodies are delimited by braces, not keywords like "fi".
     let mut brace_count = 0i32;
     for token in tokens {
@@ -81,6 +93,7 @@ fn needs_more_compound(tokens: &[String], kind: CompoundKind) -> bool {
                 for_count -= 1;
             }
             "for" => for_count += 1,
+            "select" => select_count += 1,
             "case" => case_count += 1,
             "esac" => case_count -= 1,
             "{" => brace_count += 1,
@@ -92,8 +105,9 @@ fn needs_more_compound(tokens: &[String], kind: CompoundKind) -> bool {
         CompoundKind::If => if_count > 0,
         CompoundKind::While => while_count > 0,
         CompoundKind::For => for_count > 0,
+        CompoundKind::Select => select_count > 0,
         CompoundKind::Case => case_count > 0,
-        CompoundKind::Function => brace_count > 0,
+        CompoundKind::Function | CompoundKind::Brace => brace_count > 0,
     }
 }
 
@@ -139,6 +153,7 @@ pub(crate) fn execute_for(
         Arc::clone(&state.fg_pgid),
         state.trace,
         state.sandbox.clone(),
+        state.arrays.clone(),
         &[],
         true,
     );
@@ -149,6 +164,87 @@ pub(crate) fn execute_for(
         execute_script_tokens(state, body_tokens.clone())?;
     }
     Ok(())
+}
+
+pub(crate) fn execute_select(
+    state: &mut ShellState,
+    tokens: Vec<String>,
+    _display: &str,
+) -> io::Result<()> {
+    let (var, list_tokens, body_tokens) = parse_select_tokens(tokens)?;
+    let ctx = build_expansion_context(
+        Arc::clone(&state.fg_pgid),
+        state.trace,
+        state.sandbox.clone(),
+        state.arrays.clone(),
+        &[],
+        true,
+    );
+    let expanded = expand_tokens(list_tokens, &ctx)
+        .map_err(|msg| io::Error::new(io::ErrorKind::InvalidInput, msg))?;
+    let ProcessSubstResult { tokens: expanded, keep_fds } = apply_process_subst(
+        expanded,
+        Arc::clone(&state.fg_pgid),
+        state.trace,
+        state.sandbox.clone(),
+        state.arrays.clone(),
+        true,
+    )?;
+    let _fd_guard = FdGuard(keep_fds);
+    let items = expand_globs(expanded)
+        .map_err(|msg| io::Error::new(io::ErrorKind::InvalidInput, msg))?;
+    let ps3 = std::env::var("PS3").unwrap_or_else(|_| "#? ".to_string());
+
+    loop {
+        for (idx, item) in items.iter().enumerate() {
+            println!("{:>2}) {}", idx + 1, item);
+        }
+        let line = match read_input_line(&mut state.editor, state.interactive, &ps3)? {
+            Some(line) => line,
+            None => {
+                state.last_status = 1;
+                return Ok(());
+            }
+        };
+        let input = line.trim();
+        if input.is_empty() {
+            continue;
+        }
+        std::env::set_var("REPLY", input);
+        let selected = input
+            .parse::<usize>()
+            .ok()
+            .and_then(|idx| items.get(idx.saturating_sub(1)).cloned())
+            .unwrap_or_default();
+        std::env::set_var(&var, selected);
+        execute_script_tokens(state, body_tokens.clone())?;
+    }
+}
+
+pub(crate) fn execute_brace_group(
+    state: &mut ShellState,
+    tokens: Vec<String>,
+    _display: &str,
+) -> io::Result<()> {
+    if tokens.first().map(String::as_str) != Some("{")
+        || tokens.last().map(String::as_str) != Some("}")
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid brace group",
+        ));
+    }
+    let mut inner = tokens[1..tokens.len() - 1].to_vec();
+    if let Some(last) = inner.last() {
+        if token_str(last) == ";" {
+            inner.pop();
+        }
+    }
+    if inner.is_empty() {
+        state.last_status = 0;
+        return Ok(());
+    }
+    execute_script_tokens(state, inner)
 }
 
 struct CaseClause {
@@ -166,6 +262,7 @@ pub(crate) fn execute_case(
         Arc::clone(&state.fg_pgid),
         state.trace,
         state.sandbox.clone(),
+        state.arrays.clone(),
         &[],
         true,
     );
@@ -360,6 +457,70 @@ fn parse_for_tokens(tokens: Vec<String>) -> io::Result<(String, Vec<String>, Vec
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "invalid for statement",
+        ));
+    }
+    Ok((var, list, body))
+}
+
+fn parse_select_tokens(tokens: Vec<String>) -> io::Result<(String, Vec<String>, Vec<String>)> {
+    let mut iter = tokens.into_iter();
+    let mut var = String::new();
+    let mut list = Vec::new();
+    let mut body = Vec::new();
+    let mut stage = "select";
+    while let Some(token) = iter.next() {
+        let t = token_str(&token).to_string();
+        match stage {
+            "select" => {
+                if t == "select" {
+                    continue;
+                } else {
+                    var = token;
+                    stage = "in";
+                }
+            }
+            "in" => {
+                if t == "in" {
+                    stage = "list";
+                } else {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "expected 'in' after select variable",
+                    ));
+                }
+            }
+            "list" => {
+                if t == ";" || t == "do" {
+                    if t == "do" {
+                        stage = "do";
+                    }
+                    break;
+                } else {
+                    list.push(token);
+                }
+            }
+            _ => {}
+        }
+    }
+    if stage == "do" {
+        for token in iter {
+            let t = token_str(&token).to_string();
+            if t == "done" {
+                break;
+            } else {
+                body.push(token);
+            }
+        }
+    } else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "expected 'do' in select statement",
+        ));
+    }
+    if var.is_empty() || body.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid select statement",
         ));
     }
     Ok((var, list, body))

@@ -75,6 +75,23 @@ mod tests {
         assert_eq!(expanded[1], p2.display().to_string());
     }
 
+    #[test]
+    fn expand_globs_globstar_recursive() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let nested = root.join("a").join("b");
+        std::fs::create_dir_all(&nested).unwrap();
+        let f1 = root.join("root.rs");
+        let f2 = nested.join("deep.rs");
+        std::fs::write(&f1, "root").unwrap();
+        std::fs::write(&f2, "deep").unwrap();
+
+        let pattern = format!("{}/**/*.rs", root.display());
+        let expanded = expand_globs(vec![pattern]).unwrap();
+        assert!(expanded.contains(&f1.display().to_string()));
+        assert!(expanded.contains(&f2.display().to_string()));
+    }
+
     proptest! {
         #[test]
         fn glob_pattern_no_wildcards_no_glob(s in "[^\u{1d}\u{1e}\u{1f}*?]{0,32}") {

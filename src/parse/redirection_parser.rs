@@ -151,3 +151,21 @@ pub(crate) fn try_parse_sandbox_directive(
     let directive = crate::parse::parse_sandbox_value(&value)?;
     Ok(Some(directive))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_dup_target_accepts_close_and_dup() {
+        assert_eq!(parse_dup_target("&-").unwrap(), Some((0, true)));
+        assert_eq!(parse_dup_target("&1").unwrap(), Some((1, false)));
+        assert_eq!(parse_dup_target("&2").unwrap(), Some((2, false)));
+    }
+
+    #[test]
+    fn parse_dup_target_rejects_invalid() {
+        assert!(parse_dup_target("&x").is_err());
+        assert!(parse_dup_target("&1x").is_err());
+    }
+}

@@ -310,6 +310,10 @@ mod tests {
         let (pipeline, _) = split_pipeline(tokens).unwrap();
         assert!(pipeline[0].stderr_to_stdout);
 
+        let tokens = parse_line("cmd 2>&-").unwrap();
+        let (pipeline, _) = split_pipeline(tokens).unwrap();
+        assert!(pipeline[0].stderr_close);
+
         let tokens = parse_line("cmd &> both").unwrap();
         let (pipeline, _) = split_pipeline(tokens).unwrap();
         assert_eq!(pipeline[0].stdout.as_ref().unwrap().path, "both");
@@ -330,6 +334,30 @@ mod tests {
         let heredoc = pipeline[0].heredoc.as_ref().unwrap();
         assert_eq!(heredoc.delimiter, "EOF");
         assert!(!heredoc.quoted);
+    }
+
+    #[test]
+    fn split_pipeline_rejects_duplicate_redirections() {
+        let tokens = parse_line("cmd > out1 > out2").unwrap();
+        assert_eq!(
+            split_pipeline(tokens).unwrap_err(),
+            "multiple output redirections"
+        );
+
+        let tokens = parse_line("cmd 2> err1 2> err2").unwrap();
+        assert_eq!(
+            split_pipeline(tokens).unwrap_err(),
+            "multiple stderr redirections"
+        );
+    }
+
+    #[test]
+    fn split_pipeline_rejects_unsupported_fd_dup() {
+        let tokens = parse_line("cmd 2>&3").unwrap();
+        assert_eq!(
+            split_pipeline(tokens).unwrap_err(),
+            "unsupported fd redirection"
+        );
     }
 
 

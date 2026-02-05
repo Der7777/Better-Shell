@@ -32,6 +32,8 @@ use crate::parse::{
 };
 use crate::prompt::PromptTheme;
 use crate::build_expansion_context;
+use crate::process_subst::{apply_process_subst, FdGuard, ProcessSubstResult};
+use crate::arithmetic::eval_arithmetic;
 
 pub(crate) struct ShellState {
     pub(crate) editor: Editor<LineHelper, DefaultHistory>,
@@ -49,6 +51,7 @@ pub(crate) struct ShellState {
     pub(crate) functions: HashMap<String, Vec<String>>,
     pub(crate) abbreviations: HashMap<String, Vec<String>>,
     pub(crate) completions: CompletionSet,
+    pub(crate) arrays: HashMap<String, Vec<String>>,
     pub(crate) jobs: Vec<Job>,
     pub(crate) next_job_id: usize,
     pub(crate) last_status: i32,
@@ -57,6 +60,7 @@ pub(crate) struct ShellState {
     pub(crate) interactive: bool,
     pub(crate) trace: bool,
     pub(crate) sandbox: SandboxConfig,
+    pub(crate) local_scopes: Vec<HashMap<String, Option<String>>>,
 }
 
 pub(crate) fn init_state(
@@ -95,6 +99,7 @@ pub(crate) fn init_state(
         functions: HashMap::new(),
         abbreviations: HashMap::new(),
         completions: CompletionSet::default(),
+        arrays: HashMap::new(),
         jobs: Vec::new(),
         next_job_id: 1,
         last_status: 0,
@@ -102,6 +107,7 @@ pub(crate) fn init_state(
         interactive,
         trace,
         sandbox: SandboxConfig::default(),
+        local_scopes: Vec::new(),
     };
     if let Err(err) = load_config(
         &mut state.aliases,
@@ -124,6 +130,76 @@ pub(crate) fn init_state(
     apply_sandbox_env(&mut state.sandbox);
 
     Ok(state)
+}
+
+impl ShellState {
+    pub(crate) fn in_local_scope(&self) -> bool {
+        !self.local_scopes.is_empty()
+    }
+
+    pub(crate) fn push_local_scope(&mut self) {
+        self.local_scopes.push(HashMap::new());
+    }
+
+    pub(crate) fn pop_local_scope(&mut self) {
+        if let Some(scope) = self.local_scopes.pop() {
+            for (name, prior) in scope {
+                match prior {
+                    Some(value) => env::set_var(&name, value),
+                    None => env::remove_var(&name),
+                }
+            }
+        }
+    }
+
+    pub(crate) fn set_local_var(&mut self, name: &str, value: &str) -> io::Result<()> {
+        if !self.in_local_scope() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "local: only valid inside a function",
+            ));
+        }
+        if let Some(scope) = self.local_scopes.last_mut() {
+            if !scope.contains_key(name) {
+                scope.insert(name.to_string(), env::var(name).ok());
+            }
+        }
+        env::set_var(name, value);
+        Ok(())
+    }
+
+    pub(crate) fn unset_var(&mut self, name: &str) {
+        if let Some(scope) = self.local_scopes.last_mut() {
+            if !scope.contains_key(name) {
+                scope.insert(name.to_string(), env::var(name).ok());
+            }
+        }
+        env::remove_var(name);
+    }
+
+    pub(crate) fn set_array(&mut self, name: &str, values: Vec<String>) {
+        self.arrays.insert(name.to_string(), values);
+    }
+
+    pub(crate) fn set_array_elem(&mut self, name: &str, index: usize, value: String) {
+        let entry = self.arrays.entry(name.to_string()).or_default();
+        if index >= entry.len() {
+            entry.resize(index + 1, String::new());
+        }
+        entry[index] = value;
+    }
+
+    pub(crate) fn unset_array(&mut self, name: &str) {
+        self.arrays.remove(name);
+    }
+
+    pub(crate) fn unset_array_elem(&mut self, name: &str, index: usize) {
+        if let Some(values) = self.arrays.get_mut(name) {
+            if index < values.len() {
+                values[index].clear();
+            }
+        }
+    }
 }
 
 pub(crate) fn run_once(state: &mut ShellState) -> io::Result<()> {
@@ -212,6 +288,7 @@ pub(crate) fn run_once(state: &mut ShellState) -> io::Result<()> {
         Arc::clone(&state.fg_pgid),
         state.trace,
         state.sandbox.clone(),
+        state.arrays.clone(),
         &[],
         !state.interactive,
     );
@@ -228,6 +305,23 @@ pub(crate) fn run_once(state: &mut ShellState) -> io::Result<()> {
     if expanded.is_empty() {
         return Ok(());
     }
+
+    let ProcessSubstResult { tokens: expanded, keep_fds } = match apply_process_subst(
+        expanded,
+        Arc::clone(&state.fg_pgid),
+        state.trace,
+        state.sandbox.clone(),
+        state.arrays.clone(),
+        !state.interactive,
+    ) {
+        Ok(v) => v,
+        Err(err) => {
+            eprintln!("process substitution error: {err}");
+            state.last_status = 2;
+            return Ok(());
+        }
+    };
+    let _fd_guard = FdGuard(keep_fds);
 
     let expanded = match expand_globs(expanded) {
         Ok(v) => v,
@@ -282,6 +376,9 @@ pub(crate) fn execute_segment(
     let tokens = apply_abbreviations(tokens, &state.abbreviations);
     let tokens = apply_aliases(tokens, &state.aliases);
     trace_tokens(state, "segment tokens", &tokens);
+    if try_handle_array_assignment(state, &tokens)? {
+        return Ok(());
+    }
     let (mut pipeline, background) = match split_pipeline(tokens) {
         Ok(v) => v,
         Err(msg) => {
@@ -296,6 +393,21 @@ pub(crate) fn execute_segment(
         return Ok(());
     }
     trace_command_specs(state, &pipeline);
+
+    if pipeline.len() == 1 {
+        if let Some(expr) = extract_arithmetic_expr(&pipeline[0]) {
+            match eval_arithmetic(&expr) {
+                Ok(value) => {
+                    state.last_status = if value == 0 { 1 } else { 0 };
+                }
+                Err(err) => {
+                    eprintln!("arithmetic error: {err}");
+                    state.last_status = 2;
+                }
+            }
+            return Ok(());
+        }
+    }
 
     if background {
         if pipeline
@@ -436,6 +548,9 @@ fn execute_segment_lenient(
     let tokens = apply_abbreviations(tokens, &state.abbreviations);
     let tokens = apply_aliases(tokens, &state.aliases);
     trace_tokens(state, "segment tokens", &tokens);
+    if try_handle_array_assignment(state, &tokens)? {
+        return Ok(());
+    }
     let (mut pipeline, background) = split_pipeline_lenient(tokens);
     if pipeline.is_empty() {
         return Ok(());
@@ -446,6 +561,21 @@ fn execute_segment_lenient(
         return Ok(());
     }
     trace_command_specs(state, &pipeline);
+
+    if pipeline.len() == 1 {
+        if let Some(expr) = extract_arithmetic_expr(&pipeline[0]) {
+            match eval_arithmetic(&expr) {
+                Ok(value) => {
+                    state.last_status = if value == 0 { 1 } else { 0 };
+                }
+                Err(err) => {
+                    eprintln!("arithmetic error: {err}");
+                    state.last_status = 2;
+                }
+            }
+            return Ok(());
+        }
+    }
 
     if background {
         if pipeline
@@ -624,6 +754,110 @@ fn trace_command_specs(state: &ShellState, pipeline: &[CommandSpec]) {
     }
 }
 
+fn try_handle_array_assignment(state: &mut ShellState, tokens: &[String]) -> io::Result<bool> {
+    if tokens.is_empty() {
+        return Ok(false);
+    }
+    if tokens.iter().any(|t| t.starts_with(crate::parse::OPERATOR_TOKEN_MARKER)) {
+        return Ok(false);
+    }
+    if tokens.len() == 1 {
+        if let Some((name, idx, value)) = parse_array_elem_assignment(&tokens[0]) {
+            if !crate::utils::is_valid_var_name(&name) {
+                eprintln!("array: invalid name '{name}'");
+                state.last_status = 2;
+                return Ok(true);
+            }
+            state.set_array_elem(&name, idx, value);
+            state.last_status = 0;
+            return Ok(true);
+        }
+        if let Some((name, values)) = parse_array_literal(tokens) {
+            if !crate::utils::is_valid_var_name(&name) {
+                eprintln!("array: invalid name '{name}'");
+                state.last_status = 2;
+                return Ok(true);
+            }
+            state.set_array(&name, values);
+            state.last_status = 0;
+            return Ok(true);
+        }
+        return Ok(false);
+    }
+    if let Some((name, values)) = parse_array_literal(tokens) {
+        if !crate::utils::is_valid_var_name(&name) {
+            eprintln!("array: invalid name '{name}'");
+            state.last_status = 2;
+            return Ok(true);
+        }
+        state.set_array(&name, values);
+        state.last_status = 0;
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+fn parse_array_elem_assignment(token: &str) -> Option<(String, usize, String)> {
+    let (left, value) = token.split_once('=')?;
+    let open = left.find('[')?;
+    if !left.ends_with(']') {
+        return None;
+    }
+    let name = left[..open].to_string();
+    let idx_str = &left[open + 1..left.len() - 1];
+    let idx = idx_str.parse::<usize>().ok()?;
+    Some((name, idx, value.to_string()))
+}
+
+fn parse_array_literal(tokens: &[String]) -> Option<(String, Vec<String>)> {
+    let first = tokens.first()?;
+    let eq_pos = first.find("=(")?;
+    let name = first[..eq_pos].to_string();
+    let mut values = Vec::new();
+    let mut first_val = first[eq_pos + 2..].to_string();
+    if tokens.len() == 1 {
+        if first_val.ends_with(')') {
+            first_val.pop();
+            if !first_val.is_empty() {
+                values.push(first_val);
+            }
+            return Some((name, values));
+        }
+        return None;
+    }
+    if !first_val.is_empty() {
+        values.push(first_val);
+    }
+    for token in tokens.iter().skip(1).take(tokens.len() - 2) {
+        values.push(token.clone());
+    }
+    let mut last = tokens.last()?.clone();
+    if !last.ends_with(')') {
+        return None;
+    }
+    last.pop();
+    if !last.is_empty() {
+        values.push(last);
+    }
+    Some((name, values))
+}
+
+fn extract_arithmetic_expr(cmd: &CommandSpec) -> Option<String> {
+    if cmd.args.is_empty() {
+        return None;
+    }
+    let combined = cmd.args.join(" ");
+    let trimmed = combined.trim();
+    if !trimmed.starts_with("((") || !trimmed.ends_with("))") || trimmed.len() < 4 {
+        return None;
+    }
+    let inner = trimmed[2..trimmed.len() - 2].trim();
+    if inner.is_empty() {
+        return None;
+    }
+    Some(inner.to_string())
+}
+
 fn run_prompt_function(state: &mut ShellState, name: &str) -> Option<String> {
     let tokens = state.functions.get(name)?.clone();
     let saved_status = state.last_status;
@@ -632,6 +866,7 @@ fn run_prompt_function(state: &mut ShellState, name: &str) -> Option<String> {
         Arc::clone(&state.fg_pgid),
         state.trace,
         state.sandbox.clone(),
+        state.arrays.clone(),
         true,
     )
     .ok();

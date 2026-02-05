@@ -67,6 +67,10 @@ fn parse_line_with_mode(input: &str, lenient: bool) -> Result<Vec<String>, Strin
                         args.push(format!("{OPERATOR_TOKEN_MARKER}|"));
                     }
                 }
+                '>' if expect_redir_target && !in_token => {
+                    in_token = true;
+                    buf.push('>');
+                }
                 '>' => {
                     let fd_prefix = if in_token && buf.chars().all(|c| c.is_ascii_digit()) {
                         let prefix = buf.clone();
@@ -100,6 +104,10 @@ fn parse_line_with_mode(input: &str, lenient: bool) -> Result<Vec<String>, Strin
                         args.push(format!("{OPERATOR_TOKEN_MARKER}{op}"));
                     }
                     expect_redir_target = true;
+                }
+                '<' if expect_redir_target && !in_token => {
+                    in_token = true;
+                    buf.push('<');
                 }
                 '<' => {
                     let fd_prefix = if in_token && buf.chars().all(|c| c.is_ascii_digit()) {
@@ -632,6 +640,41 @@ mod tests {
             parse_line("echo $(date").unwrap_err(),
             "unterminated $(...)"
         );
+    }
+
+    #[test]
+    fn redirection_target_required_in_strict_mode() {
+        let err = parse_line("echo >").unwrap_err();
+        assert!(err.to_lowercase().contains("expected redirection target"));
+
+        let err = parse_line("cat <<").unwrap_err();
+        assert!(err.to_lowercase().contains("expected redirection target"));
+    }
+
+    #[test]
+    fn redirection_target_lenient_mode_allows_missing() {
+        let tokens = parse_line_lenient("echo >").unwrap();
+        assert_eq!(tokens, vec!["echo", format!("{OPERATOR_TOKEN_MARKER}>")]);
+    }
+
+    #[test]
+    fn mixed_operators_without_spaces() {
+        let tokens = parse_line("echo a&&b||c;d").unwrap();
+        let stripped: Vec<String> = tokens
+            .into_iter()
+            .map(|t| strip_all_markers(&t))
+            .collect();
+        assert_eq!(stripped, vec!["echo", "a", "&&", "b", "||", "c", ";", "d"]);
+    }
+
+    #[test]
+    fn fd_redirection_without_space() {
+        let tokens = parse_line("echo 2>err").unwrap();
+        let stripped: Vec<String> = tokens
+            .into_iter()
+            .map(|t| strip_all_markers(&t))
+            .collect();
+        assert_eq!(stripped, vec!["echo", "2>", "err"]);
     }
 
     #[test]

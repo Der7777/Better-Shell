@@ -43,6 +43,7 @@ pub fn fuzz_expand_bytes(data: &[u8]) {
     let input = String::from_utf8_lossy(data);
     let ctx = ExpansionContext {
         lookup_var: Box::new(|_| Some(String::new())),
+        lookup_array: Box::new(|_| None),
         command_subst: Box::new(|_| Ok(String::new())),
         positional: &[],
         strict: true,

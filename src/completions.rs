@@ -8,7 +8,21 @@ use crate::completion::matching::best_suggestion;
 use crate::parse::parse_line;
 
 const BUILTIN_COMMANDS: &[&str] = &[
-    "cd", "pwd", "jobs", "fg", "bg", "help", "exit", "set", "abbr", "complete",
+    "cd",
+    "pwd",
+    "jobs",
+    "fg",
+    "bg",
+    "help",
+    "exit",
+    "set",
+    "unset",
+    "local",
+    "getopts",
+    "type",
+    "fc",
+    "abbr",
+    "complete",
 ];
 
 #[derive(Clone, Debug, Default)]
