@@ -1,4 +1,5 @@
 use std::io;
+use std::fmt::Write;
 
 use crate::colors::{apply_color_setting, format_color_lines, resolve_color, save_colors};
 use crate::completions::{
@@ -11,13 +12,17 @@ use crate::ShellState;
 
 use super::scripting::execute_script_tokens;
 
-pub(crate) fn handle_abbr(state: &mut ShellState, args: &[String]) -> io::Result<()> {
+pub(crate) fn handle_abbr(
+    state: &mut ShellState,
+    args: &[String],
+    output: &mut String,
+) -> io::Result<()> {
     // Abbreviations expand at command position, unlike aliases which replace commands.
     if args.len() == 1 {
         let mut entries: Vec<_> = state.abbreviations.iter().collect();
         entries.sort_by_key(|(name, _)| *name);
         for (name, tokens) in entries {
-            println!("{}", format_abbreviation_line(name, tokens));
+            let _ = writeln!(output, "{}", format_abbreviation_line(name, tokens));
         }
         state.last_status = 0;
         return Ok(());
@@ -64,11 +69,15 @@ pub(crate) fn handle_abbr(state: &mut ShellState, args: &[String]) -> io::Result
     Ok(())
 }
 
-pub(crate) fn handle_complete(state: &mut ShellState, args: &[String]) -> io::Result<()> {
+pub(crate) fn handle_complete(
+    state: &mut ShellState,
+    args: &[String],
+    output: &mut String,
+) -> io::Result<()> {
     // Completions can come from user and fish-compatible files.
     if args.len() == 1 {
         for line in format_completion_lines(&state.completions) {
-            println!("{line}");
+            let _ = writeln!(output, "{line}");
         }
         state.last_status = 0;
         return Ok(());
@@ -93,11 +102,15 @@ pub(crate) fn handle_complete(state: &mut ShellState, args: &[String]) -> io::Re
     Ok(())
 }
 
-pub(crate) fn handle_set_color(state: &mut ShellState, args: &[String]) -> io::Result<()> {
+pub(crate) fn handle_set_color(
+    state: &mut ShellState,
+    args: &[String],
+    output: &mut String,
+) -> io::Result<()> {
     // Persist colors so prompt theme changes survive restarts.
     if args.len() == 1 {
         for line in format_color_lines(&state.colors) {
-            println!("{line}");
+            let _ = writeln!(output, "{line}");
         }
         state.last_status = 0;
         return Ok(());
@@ -127,27 +140,34 @@ pub(crate) fn handle_set_color(state: &mut ShellState, args: &[String]) -> io::R
     Ok(())
 }
 
-pub(crate) fn handle_fish_config(state: &mut ShellState) -> io::Result<()> {
-    println!("Custom shell config (TUI placeholder).");
-    println!("Current colors:");
+pub(crate) fn handle_fish_config(state: &mut ShellState, output: &mut String) -> io::Result<()> {
+    let _ = writeln!(output, "Custom shell config (TUI placeholder).");
+    let _ = writeln!(output, "Current colors:");
     for line in format_color_lines(&state.colors) {
         let mut parts = line.splitn(2, '=');
         let key = parts.next().unwrap_or_default();
         let value = parts.next().unwrap_or_default();
         let color = resolve_color(value);
         if color.is_empty() {
-            println!("{key}={value}");
+            let _ = writeln!(output, "{key}={value}");
         } else {
-            println!("{key}={color}{value}\x1b[0m");
+            let _ = writeln!(output, "{key}={color}{value}\x1b[0m");
         }
     }
-    println!("Use: set_color key value");
-    println!("Keys: prompt_status, prompt_cwd, prompt_git, prompt_symbol, hint");
+    let _ = writeln!(output, "Use: set_color key value");
+    let _ = writeln!(
+        output,
+        "Keys: prompt_status, prompt_cwd, prompt_git, prompt_symbol, hint"
+    );
     state.last_status = 0;
     Ok(())
 }
 
-pub(crate) fn handle_source(state: &mut ShellState, args: &[String]) -> io::Result<()> {
+pub(crate) fn handle_source(
+    state: &mut ShellState,
+    args: &[String],
+    _output: &mut String,
+) -> io::Result<()> {
     if let Some(file) = args.get(1) {
         match std::fs::read_to_string(file) {
             Ok(content) => {
@@ -173,13 +193,17 @@ pub(crate) fn handle_source(state: &mut ShellState, args: &[String]) -> io::Resu
     Ok(())
 }
 
-pub(crate) fn handle_history(state: &mut ShellState, args: &[String]) -> io::Result<()> {
+pub(crate) fn handle_history(
+    state: &mut ShellState,
+    args: &[String],
+    output: &mut String,
+) -> io::Result<()> {
     if let Some(count_str) = args.get(1) {
         if let Ok(count) = count_str.parse::<usize>() {
             let history_len = state.editor.history().len();
             for i in (history_len.saturating_sub(count)..history_len).rev() {
                 if let Some(entry) = state.editor.history().get(i) {
-                    println!("{} {}", i, entry);
+                    let _ = writeln!(output, "{} {}", i, entry);
                 }
             }
         } else {
@@ -189,7 +213,7 @@ pub(crate) fn handle_history(state: &mut ShellState, args: &[String]) -> io::Res
         }
     } else {
         for (i, entry) in state.editor.history().iter().enumerate() {
-            println!("{} {}", i, entry);
+            let _ = writeln!(output, "{} {}", i, entry);
         }
     }
     state.last_status = 0;

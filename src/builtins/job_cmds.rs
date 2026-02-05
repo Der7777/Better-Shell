@@ -1,3 +1,4 @@
+use std::fmt::Write;
 use std::io;
 
 use crate::job_control::{
@@ -5,7 +6,11 @@ use crate::job_control::{
 };
 use crate::ShellState;
 
-pub(crate) fn handle_fg(state: &mut ShellState, args: &[String]) -> io::Result<()> {
+pub(crate) fn handle_fg(
+    state: &mut ShellState,
+    args: &[String],
+    _output: &mut String,
+) -> io::Result<()> {
     let job_id = parse_job_id(args.get(1))?;
     let job = match take_job(&mut state.jobs, job_id) {
         Some(job) => job,
@@ -30,7 +35,11 @@ pub(crate) fn handle_fg(state: &mut ShellState, args: &[String]) -> io::Result<(
     Ok(())
 }
 
-pub(crate) fn handle_bg(state: &mut ShellState, args: &[String]) -> io::Result<()> {
+pub(crate) fn handle_bg(
+    state: &mut ShellState,
+    args: &[String],
+    output: &mut String,
+) -> io::Result<()> {
     let job_id = parse_job_id(args.get(1))?;
     let job = match find_job(&mut state.jobs, job_id) {
         Some(job) => job,
@@ -45,7 +54,7 @@ pub(crate) fn handle_bg(state: &mut ShellState, args: &[String]) -> io::Result<(
         state.last_status = 1;
     } else {
         job.status = JobStatus::Running;
-        println!("[{}] Running {}", job.id, job.command);
+        let _ = writeln!(output, "[{}] Running {}", job.id, job.command);
         state.last_status = 0;
     }
     Ok(())

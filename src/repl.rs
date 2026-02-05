@@ -9,14 +9,17 @@ use std::sync::{
     Arc,
 };
 
-use crate::builtins::{execute_builtin, execute_function, is_builtin, try_execute_compound};
+use crate::builtins::{
+    execute_builtin, execute_builtin_capture, execute_function, is_builtin, try_execute_compound,
+};
 use crate::completion::LineHelper;
 use crate::completions::{default_completions, load_completion_files, suggest_command, CompletionSet};
 use crate::config::sandbox::apply_sandbox_env;
 use crate::config::{apply_abbreviations, apply_aliases, build_prompt, load_config};
 use crate::execution::{
-    apply_sandbox_directive, build_command, run_pipeline, sandbox_options_for_command,
-    spawn_command_background, spawn_pipeline_background, status_from_error, SandboxConfig,
+    apply_sandbox_directive, build_command, builtin_pipe, run_pipeline,
+    sandbox_options_for_command, spawn_command_background, spawn_pipeline_background,
+    status_from_error, SandboxConfig,
 };
 use crate::expansion::{expand_globs, expand_tokens};
 use crate::expansion_runner::execute_tokens_capture;
@@ -326,56 +329,92 @@ pub(crate) fn execute_segment(
     }
 
     if pipeline.len() > 1 {
-        if pipeline
-            .iter()
-            .any(|cmd| is_builtin(cmd.args.first().map(String::as_str)))
-        {
-            eprintln!("pipes only work with external commands");
-            state.last_status = 2;
-            return Ok(());
-        }
-        match run_pipeline(
-            &pipeline,
-            &state.fg_pgid,
-            state.shell_pgid,
-            state.trace,
-            &state.sandbox,
-        ) {
-            Ok(result) => {
-                if matches!(result.outcome, WaitOutcome::Stopped) {
-                    let job_id = add_job_with_status(
-                        &mut state.jobs,
-                        &mut state.next_job_id,
-                        result.pgid,
-                        result.last_pid,
-                        pipeline.len(),
-                        display,
-                        JobStatus::Stopped,
-                    );
-                    println!("[{job_id}] Stopped {display}");
-                    state.last_status = 128 + libc::SIGTSTP;
-                } else {
-                    let last = result.status_code.unwrap_or(0);
-                    let pipefail = result.pipefail_status.unwrap_or(last);
+        let has_builtin = pipeline.iter().any(|cmd| {
+            let name = cmd.args.first().map(String::as_str);
+            is_builtin(name) || matches!(name, Some("set"))
+        });
+        if has_builtin {
+            match builtin_pipe(
+                &pipeline,
+                |cmd| {
+                    let name = cmd.args.first().map(String::as_str);
+                    is_builtin(name) || matches!(name, Some("set"))
+                },
+                |cmd, stdin| execute_builtin_capture(state, cmd, display, stdin),
+                state.trace,
+                &state.sandbox,
+            ) {
+                Ok(result) => {
+                    let last = result.status_code;
+                    let pipefail = if result.pipefail_status == 0 {
+                        last
+                    } else {
+                        result.pipefail_status
+                    };
                     state.last_status = if state.pipefail { pipefail } else { last };
                 }
-            }
-            Err(err) => {
-                eprintln!("{err}");
-                if err.kind() == io::ErrorKind::NotFound {
-                    if let Some(suggestion) = suggest_command(
-                        &pipeline[0].args[0],
-                        &state.aliases,
-                        &state.functions,
-                        &state.abbreviations,
-                        &state.completions,
-                    ) {
-                        if suggestion != pipeline[0].args[0] {
-                            eprintln!("Command not found—did you mean '{suggestion}'?");
+                Err(err) => {
+                    eprintln!("{err}");
+                    if err.kind() == io::ErrorKind::NotFound {
+                        if let Some(suggestion) = suggest_command(
+                            &pipeline[0].args[0],
+                            &state.aliases,
+                            &state.functions,
+                            &state.abbreviations,
+                            &state.completions,
+                        ) {
+                            if suggestion != pipeline[0].args[0] {
+                                eprintln!("Command not found—did you mean '{suggestion}'?");
+                            }
                         }
                     }
+                    state.last_status = status_from_error(&err);
                 }
-                state.last_status = status_from_error(&err);
+            }
+        } else {
+            match run_pipeline(
+                &pipeline,
+                &state.fg_pgid,
+                state.shell_pgid,
+                state.trace,
+                &state.sandbox,
+            ) {
+                Ok(result) => {
+                    if matches!(result.outcome, WaitOutcome::Stopped) {
+                        let job_id = add_job_with_status(
+                            &mut state.jobs,
+                            &mut state.next_job_id,
+                            result.pgid,
+                            result.last_pid,
+                            pipeline.len(),
+                            display,
+                            JobStatus::Stopped,
+                        );
+                        println!("[{job_id}] Stopped {display}");
+                        state.last_status = 128 + libc::SIGTSTP;
+                    } else {
+                        let last = result.status_code.unwrap_or(0);
+                        let pipefail = result.pipefail_status.unwrap_or(last);
+                        state.last_status = if state.pipefail { pipefail } else { last };
+                    }
+                }
+                Err(err) => {
+                    eprintln!("{err}");
+                    if err.kind() == io::ErrorKind::NotFound {
+                        if let Some(suggestion) = suggest_command(
+                            &pipeline[0].args[0],
+                            &state.aliases,
+                            &state.functions,
+                            &state.abbreviations,
+                            &state.completions,
+                        ) {
+                            if suggestion != pipeline[0].args[0] {
+                                eprintln!("Command not found—did you mean '{suggestion}'?");
+                            }
+                        }
+                    }
+                    state.last_status = status_from_error(&err);
+                }
             }
         }
         return Ok(());
@@ -440,56 +479,92 @@ fn execute_segment_lenient(
     }
 
     if pipeline.len() > 1 {
-        if pipeline
-            .iter()
-            .any(|cmd| is_builtin(cmd.args.first().map(String::as_str)))
-        {
-            eprintln!("pipes only work with external commands");
-            state.last_status = 2;
-            return Ok(());
-        }
-        match run_pipeline(
-            &pipeline,
-            &state.fg_pgid,
-            state.shell_pgid,
-            state.trace,
-            &state.sandbox,
-        ) {
-            Ok(result) => {
-                if matches!(result.outcome, WaitOutcome::Stopped) {
-                    let job_id = add_job_with_status(
-                        &mut state.jobs,
-                        &mut state.next_job_id,
-                        result.pgid,
-                        result.last_pid,
-                        pipeline.len(),
-                        display,
-                        JobStatus::Stopped,
-                    );
-                    println!("[{job_id}] Stopped {display}");
-                    state.last_status = 128 + libc::SIGTSTP;
-                } else {
-                    let last = result.status_code.unwrap_or(0);
-                    let pipefail = result.pipefail_status.unwrap_or(last);
+        let has_builtin = pipeline.iter().any(|cmd| {
+            let name = cmd.args.first().map(String::as_str);
+            is_builtin(name) || matches!(name, Some("set"))
+        });
+        if has_builtin {
+            match builtin_pipe(
+                &pipeline,
+                |cmd| {
+                    let name = cmd.args.first().map(String::as_str);
+                    is_builtin(name) || matches!(name, Some("set"))
+                },
+                |cmd, stdin| execute_builtin_capture(state, cmd, display, stdin),
+                state.trace,
+                &state.sandbox,
+            ) {
+                Ok(result) => {
+                    let last = result.status_code;
+                    let pipefail = if result.pipefail_status == 0 {
+                        last
+                    } else {
+                        result.pipefail_status
+                    };
                     state.last_status = if state.pipefail { pipefail } else { last };
                 }
-            }
-            Err(err) => {
-                eprintln!("{err}");
-                if err.kind() == io::ErrorKind::NotFound {
-                    if let Some(suggestion) = suggest_command(
-                        &pipeline[0].args[0],
-                        &state.aliases,
-                        &state.functions,
-                        &state.abbreviations,
-                        &state.completions,
-                    ) {
-                        if suggestion != pipeline[0].args[0] {
-                            eprintln!("Command not found—did you mean '{suggestion}'?");
+                Err(err) => {
+                    eprintln!("{err}");
+                    if err.kind() == io::ErrorKind::NotFound {
+                        if let Some(suggestion) = suggest_command(
+                            &pipeline[0].args[0],
+                            &state.aliases,
+                            &state.functions,
+                            &state.abbreviations,
+                            &state.completions,
+                        ) {
+                            if suggestion != pipeline[0].args[0] {
+                                eprintln!("Command not found—did you mean '{suggestion}'?");
+                            }
                         }
                     }
+                    state.last_status = status_from_error(&err);
                 }
-                state.last_status = status_from_error(&err);
+            }
+        } else {
+            match run_pipeline(
+                &pipeline,
+                &state.fg_pgid,
+                state.shell_pgid,
+                state.trace,
+                &state.sandbox,
+            ) {
+                Ok(result) => {
+                    if matches!(result.outcome, WaitOutcome::Stopped) {
+                        let job_id = add_job_with_status(
+                            &mut state.jobs,
+                            &mut state.next_job_id,
+                            result.pgid,
+                            result.last_pid,
+                            pipeline.len(),
+                            display,
+                            JobStatus::Stopped,
+                        );
+                        println!("[{job_id}] Stopped {display}");
+                        state.last_status = 128 + libc::SIGTSTP;
+                    } else {
+                        let last = result.status_code.unwrap_or(0);
+                        let pipefail = result.pipefail_status.unwrap_or(last);
+                        state.last_status = if state.pipefail { pipefail } else { last };
+                    }
+                }
+                Err(err) => {
+                    eprintln!("{err}");
+                    if err.kind() == io::ErrorKind::NotFound {
+                        if let Some(suggestion) = suggest_command(
+                            &pipeline[0].args[0],
+                            &state.aliases,
+                            &state.functions,
+                            &state.abbreviations,
+                            &state.completions,
+                        ) {
+                            if suggestion != pipeline[0].args[0] {
+                                eprintln!("Command not found—did you mean '{suggestion}'?");
+                            }
+                        }
+                    }
+                    state.last_status = status_from_error(&err);
+                }
             }
         }
         return Ok(());

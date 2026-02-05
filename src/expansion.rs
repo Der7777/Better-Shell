@@ -31,8 +31,10 @@ pub fn expand_tokens(
             expanded.push(token);
             continue;
         }
-        let value = expand_token(&token, ctx)?;
-        expanded.push(value);
+        for brace_token in expand_braces(&token) {
+            let value = expand_token(&brace_token, ctx)?;
+            expanded.push(value);
+        }
     }
     Ok(expanded)
 }
@@ -226,6 +228,226 @@ fn enforce_no_glob(value: &str) -> String {
     out
 }
 
+fn expand_braces(token: &str) -> Vec<String> {
+    if let Some((start, end, alts)) = find_expandable_brace(token) {
+        let mut expanded = Vec::new();
+        let prefix = &token[..start];
+        let suffix = &token[end + 1..];
+        for alt in alts {
+            let mut combined = String::with_capacity(prefix.len() + alt.len() + suffix.len());
+            combined.push_str(prefix);
+            combined.push_str(&alt);
+            combined.push_str(suffix);
+            expanded.extend(expand_braces(&combined));
+        }
+        expanded
+    } else {
+        vec![token.to_string()]
+    }
+}
+
+fn find_expandable_brace(token: &str) -> Option<(usize, usize, Vec<String>)> {
+    let mut iter = token.char_indices().peekable();
+    let mut depth = 0usize;
+    let mut start = None;
+
+    while let Some((idx, ch)) = iter.next() {
+        if ch == ESCAPE_MARKER || ch == NOGLOB_MARKER {
+            iter.next();
+            continue;
+        }
+        if ch == '{' {
+            if depth == 0 {
+                start = Some(idx);
+            }
+            depth += 1;
+            continue;
+        }
+        if ch == '}' && depth > 0 {
+            depth -= 1;
+            if depth == 0 {
+                let open = start?;
+                let inner = &token[open + 1..idx];
+                if let Some(alts) = parse_brace_alternatives(inner) {
+                    return Some((open, idx, alts));
+                }
+                start = None;
+            }
+        }
+    }
+    None
+}
+
+fn parse_brace_alternatives(inner: &str) -> Option<Vec<String>> {
+    let (items, had_comma) = split_top_level_commas(inner);
+    if had_comma {
+        return Some(items);
+    }
+    parse_brace_range(inner)
+}
+
+fn split_top_level_commas(inner: &str) -> (Vec<String>, bool) {
+    let mut iter = inner.char_indices().peekable();
+    let mut depth = 0usize;
+    let mut start = 0usize;
+    let mut parts = Vec::new();
+    let mut had_comma = false;
+
+    while let Some((idx, ch)) = iter.next() {
+        if ch == ESCAPE_MARKER || ch == NOGLOB_MARKER {
+            iter.next();
+            continue;
+        }
+        match ch {
+            '{' => depth += 1,
+            '}' => {
+                if depth > 0 {
+                    depth -= 1;
+                }
+            }
+            ',' if depth == 0 => {
+                had_comma = true;
+                parts.push(inner[start..idx].to_string());
+                start = idx + 1;
+            }
+            _ => {}
+        }
+    }
+
+    if had_comma {
+        parts.push(inner[start..].to_string());
+    } else {
+        parts.push(inner.to_string());
+    }
+
+    (parts, had_comma)
+}
+
+fn parse_brace_range(inner: &str) -> Option<Vec<String>> {
+    if inner.contains(ESCAPE_MARKER) || inner.contains(NOGLOB_MARKER) {
+        return None;
+    }
+    let parts = split_top_level_ranges(inner)?;
+    if parts.len() < 2 || parts.len() > 3 {
+        return None;
+    }
+    let start = parts[0].trim();
+    let end = parts[1].trim();
+    let step = if parts.len() == 3 {
+        Some(parts[2].trim())
+    } else {
+        None
+    };
+
+    if start.is_empty() || end.is_empty() {
+        return None;
+    }
+
+    if let (Ok(start_num), Ok(end_num)) = (start.parse::<i64>(), end.parse::<i64>()) {
+        let step_val = if let Some(step) = step {
+            step.parse::<i64>().ok()?
+        } else if start_num <= end_num {
+            1
+        } else {
+            -1
+        };
+        if step_val == 0 {
+            return None;
+        }
+        if (end_num - start_num) != 0 && (end_num - start_num).signum() != step_val.signum() {
+            return None;
+        }
+        let mut values = Vec::new();
+        let mut current = start_num;
+        if step_val > 0 {
+            while current <= end_num {
+                values.push(current.to_string());
+                current += step_val;
+            }
+        } else {
+            while current >= end_num {
+                values.push(current.to_string());
+                current += step_val;
+            }
+        }
+        return Some(values);
+    }
+
+    let start_char: Vec<char> = start.chars().collect();
+    let end_char: Vec<char> = end.chars().collect();
+    if start_char.len() == 1 && end_char.len() == 1 {
+        let start_val = start_char[0] as i64;
+        let end_val = end_char[0] as i64;
+        let step_val = if let Some(step) = step {
+            step.parse::<i64>().ok()?
+        } else if start_val <= end_val {
+            1
+        } else {
+            -1
+        };
+        if step_val == 0 {
+            return None;
+        }
+        if (end_val - start_val) != 0 && (end_val - start_val).signum() != step_val.signum() {
+            return None;
+        }
+        let mut values = Vec::new();
+        let mut current = start_val;
+        if step_val > 0 {
+            while current <= end_val {
+                values.push(char::from_u32(current as u32)?.to_string());
+                current += step_val;
+            }
+        } else {
+            while current >= end_val {
+                values.push(char::from_u32(current as u32)?.to_string());
+                current += step_val;
+            }
+        }
+        return Some(values);
+    }
+
+    None
+}
+
+fn split_top_level_ranges(inner: &str) -> Option<Vec<String>> {
+    let mut iter = inner.char_indices().peekable();
+    let mut depth = 0usize;
+    let mut start = 0usize;
+    let mut parts = Vec::new();
+
+    while let Some((idx, ch)) = iter.next() {
+        if ch == ESCAPE_MARKER || ch == NOGLOB_MARKER {
+            iter.next();
+            continue;
+        }
+        match ch {
+            '{' => depth += 1,
+            '}' => {
+                if depth > 0 {
+                    depth -= 1;
+                }
+            }
+            '.' if depth == 0 => {
+                if let Some((next_idx, next_ch)) = iter.peek().copied() {
+                    if next_ch == '.' {
+                        parts.push(inner[start..idx].to_string());
+                        iter.next();
+                        start = next_idx + 1;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if parts.is_empty() {
+        return None;
+    }
+    parts.push(inner[start..].to_string());
+    Some(parts)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -280,6 +502,40 @@ mod tests {
             let expanded = expand_tokens(tokens, &ctx).unwrap();
             assert_eq!(expanded, vec!["a:b"]);
         });
+    }
+
+    #[test]
+    fn brace_expansion_lists() {
+        let ctx = ctx_no_subst();
+        let tokens = vec!["a{b,c}d".to_string()];
+        let expanded = expand_tokens(tokens, &ctx).unwrap();
+        assert_eq!(expanded, vec!["abd", "acd"]);
+    }
+
+    #[test]
+    fn brace_expansion_numeric_range() {
+        let ctx = ctx_no_subst();
+        let tokens = vec!["{1..3}".to_string()];
+        let expanded = expand_tokens(tokens, &ctx).unwrap();
+        assert_eq!(expanded, vec!["1", "2", "3"]);
+    }
+
+    #[test]
+    fn brace_expansion_alpha_range() {
+        let ctx = ctx_no_subst();
+        let tokens = vec!["{a..c}".to_string()];
+        let expanded = expand_tokens(tokens, &ctx).unwrap();
+        assert_eq!(expanded, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn brace_expansion_ignores_quoted_braces() {
+        let ctx = ctx_no_subst();
+        let token = format!(
+            "{ESCAPE_MARKER}{{{ESCAPE_MARKER}a{ESCAPE_MARKER},{ESCAPE_MARKER}b{ESCAPE_MARKER}}"
+        );
+        let expanded = expand_tokens(vec![token], &ctx).unwrap();
+        assert_eq!(strip_markers(&expanded[0]), "{a,b}");
     }
 
     use tempfile::tempdir;

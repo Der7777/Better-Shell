@@ -5,12 +5,14 @@ mod scripting;
 
 pub(crate) use scripting::execute_function;
 
-use std::io;
+use std::fmt::Write;
+use std::io::{self, Read};
 
 use crate::completions::suggest_command;
 use crate::error::{ErrorKind, ShellError};
 use crate::execution::{
-    build_command, run_command_in_foreground, sandbox_options_for_command, status_from_error,
+    build_command, command_stdin_reader, run_command_in_foreground, sandbox_options_for_command,
+    status_from_error, write_command_output, CaptureResult,
 };
 use crate::job_control::{add_job_with_status, list_jobs, JobStatus, WaitOutcome};
 use crate::parse::CommandSpec;
@@ -38,6 +40,9 @@ pub fn is_builtin(cmd: Option<&str>) -> bool {
                 | "fg"
                 | "bg"
                 | "help"
+                | "echo"
+                | "true"
+                | "false"
                 | "abbr"
                 | "complete"
                 | "set_color"
@@ -84,124 +89,15 @@ pub fn try_execute_compound(
 pub fn execute_builtin(state: &mut ShellState, cmd: &CommandSpec, display: &str) -> io::Result<()> {
     let args = &cmd.args;
     let name = args.first().map(String::as_str);
+    if matches!(name, Some(name) if is_builtin(Some(name)) || name == "set") {
+        let mut stdin = command_stdin_reader(cmd, None)?;
+        let result = execute_builtin_capture(state, cmd, display, stdin.as_deref_mut())?;
+        write_command_output(cmd, &result.output)?;
+        state.last_status = result.status_code;
+        return Ok(());
+    }
+
     match name {
-        Some("exit") => {
-            let code = args
-                .get(1)
-                .and_then(|s| s.parse::<i32>().ok())
-                .unwrap_or(state.last_status);
-            std::process::exit(code);
-        }
-        Some("cd") => {
-            let target = args.get(1).map(String::as_str).unwrap_or("~");
-            let expanded = if let Some(rest) = target.strip_prefix('~') {
-                if let Ok(home) = std::env::var("HOME") {
-                    format!("{home}{rest}")
-                } else {
-                    target.to_string()
-                }
-            } else {
-                target.to_string()
-            };
-            if let Err(err) = std::env::set_current_dir(&expanded) {
-                eprintln!("cd: {err}");
-                state.last_status = 1;
-            } else {
-                state.last_status = 0;
-            }
-        }
-        Some("pwd") => {
-            let cwd = std::env::current_dir().unwrap_or_else(|_| "/".into());
-            println!("{}", cwd.display());
-            state.last_status = 0;
-        }
-        Some("jobs") => {
-            list_jobs(&state.jobs);
-            state.last_status = 0;
-        }
-        Some("fg") => {
-            handle_fg(state, args)?;
-        }
-        Some("bg") => {
-            handle_bg(state, args)?;
-        }
-        Some("help") => {
-            if args.len() > 1 {
-                let topic = &args[1];
-                match std::process::Command::new("man").arg(topic).status() {
-                    Ok(status) => {
-                        state.last_status = if status.success() { 0 } else { 1 };
-                    }
-                    Err(err) if err.kind() == io::ErrorKind::NotFound => {
-                        eprintln!("help: man not found");
-                        state.last_status = 127;
-                    }
-                    Err(err) => {
-                        eprintln!("help: {err}");
-                        state.last_status = 1;
-                    }
-                }
-                return Ok(());
-            }
-            println!(
-                "Built-ins: cd [dir], pwd, jobs, fg [id], bg [id], help, exit [code], abbr, complete"
-            );
-            println!(
-                "External commands support pipes with |, background jobs with &, and redirection with <, >, >>, 2>, 2>>, 2>&1, &>, &>>, and <<<."
-            );
-            println!("Config: ~/.minishellrc (aliases, env vars, prompt).");
-            println!("Abbreviations: ~/.minishell_abbr (or abbr lines in ~/.minishellrc).");
-            println!("Sandbox: prefix commands with sandbox=yes/no or use --sandbox/--no-sandbox.");
-            println!("Completion: commands, filenames, $vars, %jobs.");
-            println!("Completions: ~/.minishell_completions and ~/.config/fish/completions/.");
-            println!("Prompt themes: fish (default), classic, minimal.");
-            println!("Prompt function: set prompt_function = name in config.");
-            println!("Colors: set_color key value (or ~/.minishell_colors).");
-            println!(
-                "Expansion order: quotes/escapes -> command substitution -> vars/tilde -> glob (no IFS splitting)."
-            );
-            state.last_status = 0;
-        }
-        Some("abbr") => {
-            handle_abbr(state, args)?;
-        }
-        Some("complete") => {
-            handle_complete(state, args)?;
-        }
-        Some("set_color") => {
-            handle_set_color(state, args)?;
-        }
-        Some("fish_config") => {
-            handle_fish_config(state)?;
-        }
-        Some("source") => {
-            handle_source(state, args)?;
-        }
-        Some("history") => {
-            handle_history(state, args)?;
-        }
-        Some("set") => {
-            if args.len() >= 3 && args[1] == "-o" && args[2] == "pipefail" {
-                state.pipefail = true;
-                state.last_status = 0;
-            } else if args.len() >= 3 && args[1] == "+o" && args[2] == "pipefail" {
-                state.pipefail = false;
-                state.last_status = 0;
-            } else if args.len() >= 2 && args[1] == "-x" {
-                state.trace = true;
-                state.last_status = 0;
-            } else if args.len() >= 2 && args[1] == "+x" {
-                state.trace = false;
-                state.last_status = 0;
-            } else if args.len() == 1 {
-                println!("pipefail\t{}", if state.pipefail { "on" } else { "off" });
-                println!("xtrace\t{}", if state.trace { "on" } else { "off" });
-                state.last_status = 0;
-            } else {
-                eprintln!("set: unsupported option");
-                state.last_status = 2;
-            }
-        }
         Some(cmd_name) => {
             if let Some(body) = state.functions.get(cmd_name) {
                 let body_tokens = body.clone();
@@ -263,6 +159,196 @@ pub fn execute_builtin(state: &mut ShellState, cmd: &CommandSpec, display: &str)
     Ok(())
 }
 
+pub fn execute_builtin_capture(
+    state: &mut ShellState,
+    cmd: &CommandSpec,
+    display: &str,
+    mut stdin: Option<&mut dyn Read>,
+) -> io::Result<CaptureResult> {
+    let mut output = String::new();
+    let status = execute_builtin_with_output(state, cmd, display, stdin, &mut output)?;
+    Ok(CaptureResult {
+        output,
+        status_code: status,
+    })
+}
+
+fn execute_builtin_with_output(
+    state: &mut ShellState,
+    cmd: &CommandSpec,
+    _display: &str,
+    _stdin: Option<&mut dyn Read>,
+    output: &mut String,
+) -> io::Result<i32> {
+    let args = &cmd.args;
+    let name = args.first().map(String::as_str);
+    match name {
+        Some("exit") => {
+            let code = args
+                .get(1)
+                .and_then(|s| s.parse::<i32>().ok())
+                .unwrap_or(state.last_status);
+            std::process::exit(code);
+        }
+        Some("cd") => {
+            let target = args.get(1).map(String::as_str).unwrap_or("~");
+            let expanded = if let Some(rest) = target.strip_prefix('~') {
+                if let Ok(home) = std::env::var("HOME") {
+                    format!("{home}{rest}")
+                } else {
+                    target.to_string()
+                }
+            } else {
+                target.to_string()
+            };
+            if let Err(err) = std::env::set_current_dir(&expanded) {
+                eprintln!("cd: {err}");
+                state.last_status = 1;
+            } else {
+                state.last_status = 0;
+            }
+        }
+        Some("pwd") => {
+            let cwd = std::env::current_dir().unwrap_or_else(|_| "/".into());
+            let _ = writeln!(output, "{}", cwd.display());
+            state.last_status = 0;
+        }
+        Some("jobs") => {
+            list_jobs(&state.jobs, output);
+            state.last_status = 0;
+        }
+        Some("fg") => {
+            handle_fg(state, args, output)?;
+        }
+        Some("bg") => {
+            handle_bg(state, args, output)?;
+        }
+        Some("help") => {
+            if args.len() > 1 {
+                let topic = &args[1];
+                match std::process::Command::new("man").arg(topic).output() {
+                    Ok(result) => {
+                        state.last_status = if result.status.success() { 0 } else { 1 };
+                        output.push_str(&String::from_utf8_lossy(&result.stdout));
+                    }
+                    Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                        eprintln!("help: man not found");
+                        state.last_status = 127;
+                    }
+                    Err(err) => {
+                        eprintln!("help: {err}");
+                        state.last_status = 1;
+                    }
+                }
+                return Ok(state.last_status);
+            }
+            let _ = writeln!(
+                output,
+                "Built-ins: cd [dir], pwd, jobs, fg [id], bg [id], help, exit [code], echo, true, false, abbr, complete"
+            );
+            let _ = writeln!(
+                output,
+                "External commands support pipes with |, background jobs with &, and redirection with <, >, >>, 2>, 2>>, 2>&1, &>, &>>, and <<<."
+            );
+            let _ = writeln!(output, "Config: ~/.minishellrc (aliases, env vars, prompt).");
+            let _ = writeln!(
+                output,
+                "Abbreviations: ~/.minishell_abbr (or abbr lines in ~/.minishellrc)."
+            );
+            let _ = writeln!(
+                output,
+                "Sandbox: prefix commands with sandbox=yes/no or use --sandbox/--no-sandbox."
+            );
+            let _ = writeln!(output, "Completion: commands, filenames, $vars, %jobs.");
+            let _ = writeln!(
+                output,
+                "Completions: ~/.minishell_completions and ~/.config/fish/completions/."
+            );
+            let _ = writeln!(output, "Prompt themes: fish (default), classic, minimal.");
+            let _ = writeln!(
+                output,
+                "Prompt function: set prompt_function = name in config."
+            );
+            let _ = writeln!(output, "Colors: set_color key value (or ~/.minishell_colors).");
+            let _ = writeln!(
+                output,
+                "Expansion order: quotes/escapes -> command substitution -> vars/tilde -> glob (no IFS splitting)."
+            );
+            state.last_status = 0;
+        }
+        Some("abbr") => {
+            handle_abbr(state, args, output)?;
+        }
+        Some("complete") => {
+            handle_complete(state, args, output)?;
+        }
+        Some("set_color") => {
+            handle_set_color(state, args, output)?;
+        }
+        Some("fish_config") => {
+            handle_fish_config(state, output)?;
+        }
+        Some("source") => {
+            handle_source(state, args, output)?;
+        }
+        Some("history") => {
+            handle_history(state, args, output)?;
+        }
+        Some("echo") => {
+            let line = args[1..].join(" ");
+            let _ = writeln!(output, "{line}");
+            state.last_status = 0;
+        }
+        Some("true") => {
+            state.last_status = 0;
+        }
+        Some("false") => {
+            state.last_status = 1;
+        }
+        Some("set") => {
+            if args.len() >= 3 && args[1] == "-o" && args[2] == "pipefail" {
+                state.pipefail = true;
+                state.last_status = 0;
+            } else if args.len() >= 3 && args[1] == "+o" && args[2] == "pipefail" {
+                state.pipefail = false;
+                state.last_status = 0;
+            } else if args.len() >= 2 && args[1] == "-x" {
+                state.trace = true;
+                state.last_status = 0;
+            } else if args.len() >= 2 && args[1] == "+x" {
+                state.trace = false;
+                state.last_status = 0;
+            } else if args.len() == 1 {
+                let _ = writeln!(
+                    output,
+                    "pipefail\t{}",
+                    if state.pipefail { "on" } else { "off" }
+                );
+                let _ = writeln!(
+                    output,
+                    "xtrace\t{}",
+                    if state.trace { "on" } else { "off" }
+                );
+                state.last_status = 0;
+            } else {
+                eprintln!("set: unsupported option");
+                state.last_status = 2;
+            }
+        }
+        Some(other) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{other}: not a builtin"),
+            ));
+        }
+        None => {
+            state.last_status = 0;
+        }
+    }
+
+    Ok(state.last_status)
+}
+
 pub fn execute_builtin_substitution(pipeline: &[CommandSpec]) -> Result<(String, i32), String> {
     if pipeline.len() != 1 {
         return Err("pipes only work with external commands".to_string());
@@ -274,7 +360,7 @@ pub fn execute_builtin_substitution(pipeline: &[CommandSpec]) -> Result<(String,
             Ok((cwd.display().to_string(), 0))
         }
         Some("help") => Ok((
-            "Built-ins: cd [dir], pwd, jobs, fg [id], bg [id], help, exit [code], abbr, complete"
+            "Built-ins: cd [dir], pwd, jobs, fg [id], bg [id], help, exit [code], echo, true, false, abbr, complete"
                 .to_string(),
             0,
         )),

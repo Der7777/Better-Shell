@@ -214,7 +214,9 @@ pub fn add_job_with_status(
     id
 }
 
-pub fn list_jobs(jobs: &[Job]) {
+pub fn list_jobs(jobs: &[Job], output: &mut String) {
+    use std::fmt::Write;
+
     if jobs.is_empty() {
         return;
     }
@@ -223,7 +225,7 @@ pub fn list_jobs(jobs: &[Job]) {
             JobStatus::Running => "Running",
             JobStatus::Stopped => "Stopped",
         };
-        println!("[{}] {status} {}", job.id, job.command);
+        let _ = writeln!(output, "[{}] {status} {}", job.id, job.command);
     }
 }
 
