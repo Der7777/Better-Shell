@@ -11,7 +11,7 @@ use crate::utils::is_valid_var_name;
 mod glob;
 
 #[allow(unused_imports)]
-pub use glob::{expand_globs_with, GlobOptions};
+pub use glob::{expand_globs, expand_globs_with, GlobOptions};
 
 type LookupVar<'a> = Box<dyn Fn(&str) -> Option<String> + 'a>;
 type CommandSubst<'a> = Box<dyn Fn(&str) -> Result<String, String> + 'a>;

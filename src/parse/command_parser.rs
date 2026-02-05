@@ -254,7 +254,7 @@ pub fn token_str(token: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::parse::{parse_line, strip_markers};
+    use crate::parse::parse_line;
 
     #[test]
     fn tokenize_operators_and_pipeline() {
@@ -313,6 +313,10 @@ mod tests {
         let tokens = parse_line("cmd 2>&-").unwrap();
         let (pipeline, _) = split_pipeline(tokens).unwrap();
         assert!(pipeline[0].stderr_close);
+
+        let tokens = parse_line("cmd 3>&-").unwrap();
+        let (pipeline, _) = split_pipeline(tokens).unwrap();
+        assert!(pipeline[0].close_fds.contains(&3));
 
         let tokens = parse_line("cmd &> both").unwrap();
         let (pipeline, _) = split_pipeline(tokens).unwrap();

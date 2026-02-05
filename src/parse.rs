@@ -13,11 +13,19 @@ mod command_parser;
 mod redirection_parser;
 mod tokenizer;
 
-pub use command_parser::token_str;
-pub use command_parser::{SeqOp, SeqSegment, split_pipeline, split_pipeline_lenient, split_sequence, split_sequence_lenient};
+#[allow(unused_imports)]
+pub use command_parser::{
+    SeqOp, SeqSegment, split_pipeline, split_pipeline_lenient, split_sequence,
+    split_sequence_lenient,
+};
+#[allow(unused_imports)]
 pub use tokenizer::{
     parse_line, parse_line_lenient, tokenize_history, HistoryDesignator, HistoryToken,
 };
+
+pub fn token_str(token: &str) -> &str {
+    command_parser::token_str(token)
+}
 pub use tokenizer::{parse_command_substitution, parse_command_substitution_lenient};
 
 #[derive(Debug, Clone)]
@@ -52,6 +60,7 @@ pub struct CommandSpec {
     pub stderr: Option<OutputRedirection>,
     pub stderr_to_stdout: bool,
     pub stderr_close: bool,
+    pub close_fds: Vec<i32>,
     pub sandbox: Option<SandboxDirective>,
 }
 
@@ -66,6 +75,7 @@ impl CommandSpec {
             stderr: None,
             stderr_to_stdout: false,
             stderr_close: false,
+            close_fds: Vec::new(),
             sandbox: None,
         }
     }

@@ -14,8 +14,8 @@ use crate::job_control::{
 use crate::parse::CommandSpec;
 
 use super::redirection::{
-    apply_input_redirection, apply_pipeline_stdin, apply_pipeline_stdout, apply_stderr_redirection,
-    apply_stdout_redirection,
+    apply_fd_closures, apply_input_redirection, apply_pipeline_stdin, apply_pipeline_stdout,
+    apply_stderr_redirection, apply_stdout_redirection,
 };
 use super::sandbox::{apply_sandbox, SandboxOptions};
 use super::{spawn_error_message, ForegroundResult};
@@ -29,6 +29,7 @@ pub fn build_command(cmd: &CommandSpec) -> io::Result<Command> {
         apply_stdout_redirection(&mut command, output)?;
     }
     apply_stderr_redirection(&mut command, cmd)?;
+    apply_fd_closures(&mut command, cmd)?;
 
     Ok(command)
 }
@@ -46,6 +47,7 @@ pub(crate) fn build_pipeline_command(
     apply_input_redirection(&mut command, cmd)?;
     apply_pipeline_stdout(&mut command, cmd, last, pipe_last_if_missing)?;
     apply_stderr_redirection(&mut command, cmd)?;
+    apply_fd_closures(&mut command, cmd)?;
 
     Ok(command)
 }

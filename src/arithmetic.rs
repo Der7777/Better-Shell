@@ -9,6 +9,7 @@ enum Op {
     Mul,
     Div,
     Mod,
+    Pow,
     Lt,
     Le,
     Gt,
@@ -22,6 +23,14 @@ enum Op {
     BitXor,
     Shl,
     Shr,
+    Assign,
+    AddAssign,
+    SubAssign,
+    MulAssign,
+    DivAssign,
+    ModAssign,
+    Inc,
+    Dec,
     UnaryPlus,
     UnaryMinus,
     Not,
@@ -31,6 +40,7 @@ enum Op {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Token {
     Num(i64),
+    Ident(String),
     Op(Op),
     LParen,
     RParen,
@@ -39,8 +49,12 @@ enum Token {
 pub fn eval_arithmetic(expr: &str) -> Result<i64, String> {
     let stripped = strip_markers(expr);
     let tokens = tokenize(&stripped)?;
-    let rpn = to_rpn(&tokens)?;
-    eval_rpn(&rpn)
+    let mut parser = Parser::new(tokens);
+    let value = parser.parse_expr(0)?.value;
+    if parser.peek().is_some() {
+        return Err("unexpected tokens at end of expression".to_string());
+    }
+    Ok(value)
 }
 
 fn tokenize(expr: &str) -> Result<Vec<Token>, String> {
@@ -84,11 +98,7 @@ fn tokenize(expr: &str) -> Result<Vec<Token>, String> {
                     break;
                 }
             }
-            let value = env::var(&name)
-                .ok()
-                .and_then(|v| v.parse::<i64>().ok())
-                .unwrap_or(0);
-            tokens.push(Token::Num(value));
+            tokens.push(Token::Ident(name));
             prev_is_op = false;
             continue;
         }
@@ -108,7 +118,13 @@ fn tokenize(expr: &str) -> Result<Vec<Token>, String> {
             }
             '+' => {
                 chars.next();
-                if prev_is_op {
+                if matches!(chars.peek(), Some('+')) {
+                    chars.next();
+                    Token::Op(Op::Inc)
+                } else if matches!(chars.peek(), Some('=')) {
+                    chars.next();
+                    Token::Op(Op::AddAssign)
+                } else if prev_is_op {
                     Token::Op(Op::UnaryPlus)
                 } else {
                     Token::Op(Op::Add)
@@ -116,7 +132,13 @@ fn tokenize(expr: &str) -> Result<Vec<Token>, String> {
             }
             '-' => {
                 chars.next();
-                if prev_is_op {
+                if matches!(chars.peek(), Some('-')) {
+                    chars.next();
+                    Token::Op(Op::Dec)
+                } else if matches!(chars.peek(), Some('=')) {
+                    chars.next();
+                    Token::Op(Op::SubAssign)
+                } else if prev_is_op {
                     Token::Op(Op::UnaryMinus)
                 } else {
                     Token::Op(Op::Sub)
@@ -137,15 +159,33 @@ fn tokenize(expr: &str) -> Result<Vec<Token>, String> {
             }
             '*' => {
                 chars.next();
-                Token::Op(Op::Mul)
+                if matches!(chars.peek(), Some('*')) {
+                    chars.next();
+                    Token::Op(Op::Pow)
+                } else if matches!(chars.peek(), Some('=')) {
+                    chars.next();
+                    Token::Op(Op::MulAssign)
+                } else {
+                    Token::Op(Op::Mul)
+                }
             }
             '/' => {
                 chars.next();
-                Token::Op(Op::Div)
+                if matches!(chars.peek(), Some('=')) {
+                    chars.next();
+                    Token::Op(Op::DivAssign)
+                } else {
+                    Token::Op(Op::Div)
+                }
             }
             '%' => {
                 chars.next();
-                Token::Op(Op::Mod)
+                if matches!(chars.peek(), Some('=')) {
+                    chars.next();
+                    Token::Op(Op::ModAssign)
+                } else {
+                    Token::Op(Op::Mod)
+                }
             }
             '<' => {
                 chars.next();
@@ -177,7 +217,7 @@ fn tokenize(expr: &str) -> Result<Vec<Token>, String> {
                     chars.next();
                     Token::Op(Op::Eq)
                 } else {
-                    return Err("unexpected '='".to_string());
+                    Token::Op(Op::Assign)
                 }
             }
             '&' => {
@@ -212,130 +252,256 @@ fn tokenize(expr: &str) -> Result<Vec<Token>, String> {
     Ok(tokens)
 }
 
-fn to_rpn(tokens: &[Token]) -> Result<Vec<Token>, String> {
-    let mut output = Vec::new();
-    let mut ops: Vec<Token> = Vec::new();
-
-    for token in tokens {
-        match token {
-            Token::Num(_) => output.push(token.clone()),
-            Token::LParen => ops.push(Token::LParen),
-            Token::RParen => {
-                while let Some(top) = ops.pop() {
-                    if matches!(top, Token::LParen) {
-                        break;
-                    }
-                    output.push(top);
-                }
-            }
-            Token::Op(op) => {
-                while let Some(top) = ops.last() {
-                    if let Token::Op(top_op) = top {
-                        let (prec1, right_assoc1) = precedence(*op);
-                        let (prec2, _) = precedence(*top_op);
-                        if prec2 > prec1 || (prec2 == prec1 && !right_assoc1) {
-                            output.push(ops.pop().unwrap());
-                            continue;
-                        }
-                    }
-                    break;
-                }
-                ops.push(Token::Op(*op));
-            }
-        }
-    }
-
-    while let Some(top) = ops.pop() {
-        if matches!(top, Token::LParen | Token::RParen) {
-            return Err("mismatched parentheses".to_string());
-        }
-        output.push(top);
-    }
-
-    Ok(output)
+#[derive(Clone)]
+struct ExprValue {
+    value: i64,
+    lvalue: Option<String>,
 }
 
-fn eval_rpn(tokens: &[Token]) -> Result<i64, String> {
-    let mut stack: Vec<i64> = Vec::new();
-    for token in tokens {
-        match token {
-            Token::Num(n) => stack.push(*n),
-            Token::Op(op) => {
-                if is_unary(*op) {
-                    let val = stack.pop().ok_or_else(|| "missing operand".to_string())?;
-                    let out = match op {
-                        Op::UnaryPlus => val,
-                        Op::UnaryMinus => -val,
-                        Op::Not => (val == 0) as i64,
-                        Op::BitNot => !val,
-                        _ => return Err("invalid unary operator".to_string()),
-                    };
-                    stack.push(out);
-                } else {
-                    let rhs = stack.pop().ok_or_else(|| "missing operand".to_string())?;
-                    let lhs = stack.pop().ok_or_else(|| "missing operand".to_string())?;
-                    let out = match op {
-                        Op::Add => lhs + rhs,
-                        Op::Sub => lhs - rhs,
-                        Op::Mul => lhs * rhs,
-                        Op::Div => {
-                            if rhs == 0 {
-                                return Err("division by zero".to_string());
-                            }
-                            lhs / rhs
-                        }
-                        Op::Mod => {
-                            if rhs == 0 {
-                                return Err("division by zero".to_string());
-                            }
-                            lhs % rhs
-                        }
-                        Op::Lt => (lhs < rhs) as i64,
-                        Op::Le => (lhs <= rhs) as i64,
-                        Op::Gt => (lhs > rhs) as i64,
-                        Op::Ge => (lhs >= rhs) as i64,
-                        Op::Eq => (lhs == rhs) as i64,
-                        Op::Ne => (lhs != rhs) as i64,
-                        Op::And => ((lhs != 0) && (rhs != 0)) as i64,
-                        Op::Or => ((lhs != 0) || (rhs != 0)) as i64,
-                        Op::BitAnd => lhs & rhs,
-                        Op::BitOr => lhs | rhs,
-                        Op::BitXor => lhs ^ rhs,
-                        Op::Shl => lhs << rhs,
-                        Op::Shr => lhs >> rhs,
-                        _ => return Err("invalid operator".to_string()),
-                    };
-                    stack.push(out);
-                }
-            }
-            _ => return Err("invalid token in expression".to_string()),
-        }
+struct Parser {
+    tokens: Vec<Token>,
+    pos: usize,
+}
+
+impl Parser {
+    fn new(tokens: Vec<Token>) -> Self {
+        Self { tokens, pos: 0 }
     }
 
-    if stack.len() != 1 {
-        return Err("invalid expression".to_string());
+    fn peek(&self) -> Option<&Token> {
+        self.tokens.get(self.pos)
     }
-    Ok(stack[0])
+
+    fn next(&mut self) -> Option<Token> {
+        if self.pos >= self.tokens.len() {
+            return None;
+        }
+        let tok = self.tokens[self.pos].clone();
+        self.pos += 1;
+        Some(tok)
+    }
+
+    fn parse_expr(&mut self, min_bp: u8) -> Result<ExprValue, String> {
+        let mut lhs = self.parse_prefix()?;
+
+        loop {
+            let op = match self.peek() {
+                Some(Token::Op(op)) => *op,
+                _ => break,
+            };
+
+            // Postfix ++ / --
+            if matches!(op, Op::Inc | Op::Dec) {
+                self.next();
+                let name = lhs
+                    .lvalue
+                    .take()
+                    .ok_or_else(|| "invalid increment target".to_string())?;
+                let current = get_var(&name);
+                let new_val = if op == Op::Inc { current + 1 } else { current - 1 };
+                set_var(&name, new_val);
+                lhs.value = current; // postfix returns old value
+                lhs.lvalue = None;
+                continue;
+            }
+
+            let (lbp, rbp) = binding_power(op);
+            if lbp < min_bp {
+                break;
+            }
+            self.next();
+            let rhs = self.parse_expr(rbp)?;
+
+            lhs = match op {
+                Op::Assign
+                | Op::AddAssign
+                | Op::SubAssign
+                | Op::MulAssign
+                | Op::DivAssign
+                | Op::ModAssign => {
+                    let name = lhs
+                        .lvalue
+                        .take()
+                        .ok_or_else(|| "invalid assignment target".to_string())?;
+                    let base = get_var(&name);
+                    let new_val = match op {
+                        Op::Assign => rhs.value,
+                        Op::AddAssign => base + rhs.value,
+                        Op::SubAssign => base - rhs.value,
+                        Op::MulAssign => base * rhs.value,
+                        Op::DivAssign => {
+                            if rhs.value == 0 {
+                                return Err("division by zero".to_string());
+                            }
+                            base / rhs.value
+                        }
+                        Op::ModAssign => {
+                            if rhs.value == 0 {
+                                return Err("division by zero".to_string());
+                            }
+                            base % rhs.value
+                        }
+                        _ => unreachable!(),
+                    };
+                    set_var(&name, new_val);
+                    ExprValue {
+                        value: new_val,
+                        lvalue: None,
+                    }
+                }
+                _ => {
+                    let out = eval_binary(op, lhs.value, rhs.value)?;
+                    ExprValue {
+                        value: out,
+                        lvalue: None,
+                    }
+                }
+            };
+        }
+
+        Ok(lhs)
+    }
+
+    fn parse_prefix(&mut self) -> Result<ExprValue, String> {
+        let token = self.next().ok_or_else(|| "unexpected end of expression".to_string())?;
+        match token {
+            Token::Num(n) => Ok(ExprValue {
+                value: n,
+                lvalue: None,
+            }),
+            Token::Ident(name) => Ok(ExprValue {
+                value: get_var(&name),
+                lvalue: Some(name),
+            }),
+            Token::LParen => {
+                let expr = self.parse_expr(0)?;
+                match self.next() {
+                    Some(Token::RParen) => {}
+                    _ => return Err("mismatched parentheses".to_string()),
+                }
+                Ok(ExprValue {
+                    value: expr.value,
+                    lvalue: None,
+                })
+            }
+            Token::Op(op) if matches!(op, Op::UnaryPlus | Op::UnaryMinus | Op::Not | Op::BitNot) => {
+                let rbp = unary_binding_power(op);
+                let rhs = self.parse_expr(rbp)?;
+                let out = match op {
+                    Op::UnaryPlus => rhs.value,
+                    Op::UnaryMinus => -rhs.value,
+                    Op::Not => (rhs.value == 0) as i64,
+                    Op::BitNot => !rhs.value,
+                    _ => unreachable!(),
+                };
+                Ok(ExprValue {
+                    value: out,
+                    lvalue: None,
+                })
+            }
+            Token::Op(op) if matches!(op, Op::Inc | Op::Dec) => {
+                let name = match self.next() {
+                    Some(Token::Ident(name)) => name,
+                    _ => return Err("invalid increment target".to_string()),
+                };
+                let current = get_var(&name);
+                let new_val = if op == Op::Inc { current + 1 } else { current - 1 };
+                set_var(&name, new_val);
+                Ok(ExprValue {
+                    value: new_val,
+                    lvalue: None,
+                })
+            }
+            Token::Op(op) => Err(format!("unexpected operator '{op:?}'")),
+            Token::RParen => Err("unexpected ')'".to_string()),
+        }
+    }
+}
+
+fn get_var(name: &str) -> i64 {
+    env::var(name)
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(0)
+}
+
+fn set_var(name: &str, value: i64) {
+    env::set_var(name, value.to_string());
+}
+
+fn eval_binary(op: Op, lhs: i64, rhs: i64) -> Result<i64, String> {
+    let out = match op {
+        Op::Add => lhs + rhs,
+        Op::Sub => lhs - rhs,
+        Op::Mul => lhs * rhs,
+        Op::Div => {
+            if rhs == 0 {
+                return Err("division by zero".to_string());
+            }
+            lhs / rhs
+        }
+        Op::Mod => {
+            if rhs == 0 {
+                return Err("division by zero".to_string());
+            }
+            lhs % rhs
+        }
+        Op::Pow => lhs.pow(rhs as u32),
+        Op::Lt => (lhs < rhs) as i64,
+        Op::Le => (lhs <= rhs) as i64,
+        Op::Gt => (lhs > rhs) as i64,
+        Op::Ge => (lhs >= rhs) as i64,
+        Op::Eq => (lhs == rhs) as i64,
+        Op::Ne => (lhs != rhs) as i64,
+        Op::And => ((lhs != 0) && (rhs != 0)) as i64,
+        Op::Or => ((lhs != 0) || (rhs != 0)) as i64,
+        Op::BitAnd => lhs & rhs,
+        Op::BitOr => lhs | rhs,
+        Op::BitXor => lhs ^ rhs,
+        Op::Shl => lhs << rhs,
+        Op::Shr => lhs >> rhs,
+        _ => return Err("invalid operator".to_string()),
+    };
+    Ok(out)
 }
 
 fn precedence(op: Op) -> (u8, bool) {
     match op {
-        Op::UnaryPlus | Op::UnaryMinus | Op::Not | Op::BitNot => (7, true),
-        Op::Mul | Op::Div | Op::Mod => (6, false),
-        Op::Add | Op::Sub => (5, false),
-        Op::Shl | Op::Shr => (4, false),
-        Op::Lt | Op::Le | Op::Gt | Op::Ge => (3, false),
-        Op::Eq | Op::Ne => (2, false),
-        Op::BitAnd => (1, false),
-        Op::BitXor => (1, false),
-        Op::BitOr => (1, false),
-        Op::And => (0, false),
-        Op::Or => (0, false),
+        Op::Pow => (8, true),
+        Op::Mul | Op::Div | Op::Mod => (7, false),
+        Op::Add | Op::Sub => (6, false),
+        Op::Shl | Op::Shr => (5, false),
+        Op::Lt | Op::Le | Op::Gt | Op::Ge => (4, false),
+        Op::Eq | Op::Ne => (3, false),
+        Op::BitAnd => (2, false),
+        Op::BitXor => (2, false),
+        Op::BitOr => (2, false),
+        Op::And => (1, false),
+        Op::Or => (1, false),
+        Op::Assign
+        | Op::AddAssign
+        | Op::SubAssign
+        | Op::MulAssign
+        | Op::DivAssign
+        | Op::ModAssign => (0, true),
+        _ => (0, false),
     }
 }
 
-fn is_unary(op: Op) -> bool {
-    matches!(op, Op::UnaryPlus | Op::UnaryMinus | Op::Not | Op::BitNot)
+fn binding_power(op: Op) -> (u8, u8) {
+    let (prec, right_assoc) = precedence(op);
+    if right_assoc {
+        (prec, prec)
+    } else {
+        (prec, prec + 1)
+    }
+}
+
+fn unary_binding_power(op: Op) -> u8 {
+    match op {
+        Op::UnaryPlus | Op::UnaryMinus | Op::Not | Op::BitNot => 7,
+        _ => 0,
+    }
 }
 
 fn is_ident_start(ch: char) -> bool {
@@ -356,6 +522,7 @@ mod tests {
         assert_eq!(eval_arithmetic("(1+2)*3").unwrap(), 9);
         assert_eq!(eval_arithmetic("10/2+3").unwrap(), 8);
         assert_eq!(eval_arithmetic("10%3").unwrap(), 1);
+        assert_eq!(eval_arithmetic("2 ** 10").unwrap(), 1024);
     }
 
     #[test]
@@ -365,5 +532,20 @@ mod tests {
         assert_eq!(eval_arithmetic("1&&0").unwrap(), 0);
         assert_eq!(eval_arithmetic("1||0").unwrap(), 1);
         assert_eq!(eval_arithmetic("!0").unwrap(), 1);
+    }
+
+    #[test]
+    fn arithmetic_increments_and_assignments() {
+        env::set_var("x", "1");
+        assert_eq!(eval_arithmetic("x++").unwrap(), 1);
+        assert_eq!(env::var("x").unwrap(), "2");
+        assert_eq!(eval_arithmetic("++x").unwrap(), 3);
+        assert_eq!(env::var("x").unwrap(), "3");
+        assert_eq!(eval_arithmetic("x += 5").unwrap(), 8);
+        assert_eq!(env::var("x").unwrap(), "8");
+        assert_eq!(eval_arithmetic("x--").unwrap(), 8);
+        assert_eq!(env::var("x").unwrap(), "7");
+        assert_eq!(eval_arithmetic("--x").unwrap(), 6);
+        assert_eq!(env::var("x").unwrap(), "6");
     }
 }

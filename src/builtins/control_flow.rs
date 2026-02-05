@@ -132,10 +132,16 @@ pub(crate) fn execute_if(
 ) -> io::Result<()> {
     let (cond_tokens, then_tokens, else_tokens) = parse_if_tokens(tokens)?;
     execute_script_tokens(state, cond_tokens)?;
+    if state.return_requested.is_some() {
+        return Ok(());
+    }
     if state.last_status == 0 {
         execute_script_tokens(state, then_tokens)?;
     } else if let Some(tokens) = else_tokens {
         execute_script_tokens(state, tokens)?;
+    }
+    if state.return_requested.is_some() {
+        return Ok(());
     }
     trace_tokens(state, "if display", &[display.to_string()]);
     Ok(())
@@ -149,10 +155,16 @@ pub(crate) fn execute_while(
     let (cond_tokens, body_tokens) = parse_while_tokens(tokens)?;
     loop {
         execute_script_tokens(state, cond_tokens.clone())?;
+        if state.return_requested.is_some() {
+            break;
+        }
         if state.last_status != 0 {
             break;
         }
         execute_script_tokens(state, body_tokens.clone())?;
+        if state.return_requested.is_some() {
+            break;
+        }
     }
     Ok(())
 }
@@ -192,6 +204,9 @@ pub(crate) fn execute_for(
     for item in list {
         std::env::set_var(&var, item);
         execute_script_tokens(state, body_tokens.clone())?;
+        if state.return_requested.is_some() {
+            break;
+        }
     }
     Ok(())
 }
@@ -265,6 +280,9 @@ pub(crate) fn execute_select(
             .unwrap_or_default();
         std::env::set_var(&var, selected);
         execute_script_tokens(state, body_tokens.clone())?;
+        if state.return_requested.is_some() {
+            return Ok(());
+        }
     }
 }
 
@@ -503,6 +521,9 @@ pub(crate) fn execute_case(
         }
         if matched {
             execute_script_tokens(state, clause.body)?;
+            if state.return_requested.is_some() {
+                return Ok(());
+            }
             trace_tokens(state, "case display", &[display.to_string()]);
             return Ok(());
         }

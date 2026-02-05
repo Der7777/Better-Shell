@@ -21,7 +21,7 @@ use crate::execution::{
 };
 use crate::job_control::{add_job_with_status, list_jobs, parse_job_id, take_job, JobStatus, WaitOutcome};
 use rustyline::{Cmd, KeyCode, KeyEvent, Modifiers, Movement};
-use crate::parse::{parse_line_lenient, CommandSpec};
+use crate::parse::{parse_line_lenient, token_str, CommandSpec};
 use crate::execute_segment;
 use crate::ShellState;
 
@@ -72,6 +72,7 @@ const BUILTINS: &[&str] = &[
     "enable",
     "shopt",
     "trap",
+    "return",
 ];
 
 pub fn builtin_names() -> &'static [&'static str] {
@@ -301,7 +302,7 @@ fn execute_builtin_with_output(
             }
             let _ = writeln!(
                 output,
-                "Built-ins: cd [dir], pwd, jobs, fg [id], bg [id], help, exit [code], hash, echo, true, false, unset, local, declare, readonly, shift, eval, alias, unalias, disown, bind, getopts, type, fc, abbr, complete, enable, shopt, trap"
+                "Built-ins: cd [dir], pwd, jobs, fg [id], bg [id], help, exit [code], hash, echo, true, false, unset, local, declare, readonly, shift, eval, alias, unalias, disown, bind, getopts, type, fc, abbr, complete, enable, shopt, trap, return"
             );
             let _ = writeln!(
                 output,
@@ -373,6 +374,34 @@ fn execute_builtin_with_output(
                 state.last_status = 0;
                 return Ok(state.last_status);
             }
+            if args[1] == "-f" {
+                if !state.in_local_scope() {
+                    eprintln!("local: only valid inside a function");
+                    state.last_status = 2;
+                    return Ok(state.last_status);
+                }
+                if args.len() < 3 {
+                    eprintln!("local: missing function name");
+                    state.last_status = 2;
+                    return Ok(state.last_status);
+                }
+                let mut failed = false;
+                for name in &args[2..] {
+                    if !crate::utils::is_valid_var_name(name) {
+                        eprintln!("local: invalid function name '{name}'");
+                        failed = true;
+                        continue;
+                    }
+                    if !state.functions.contains_key(name) {
+                        eprintln!("local: function not found '{name}'");
+                        failed = true;
+                        continue;
+                    }
+                    state.register_local_function(name);
+                }
+                state.last_status = if failed { 1 } else { 0 };
+                return Ok(state.last_status);
+            }
             let mut failed = false;
             for entry in &args[1..] {
                 let (name, value) = match entry.split_once('=') {
@@ -423,6 +452,9 @@ fn execute_builtin_with_output(
         }
         Some("declare") => {
             handle_declare(state, args)?;
+        }
+        Some("return") => {
+            handle_return(state, args)?;
         }
         Some("readonly") => {
             handle_readonly(state, args, output)?;
@@ -543,7 +575,7 @@ pub fn execute_builtin_substitution_capture(
             })
         }
         Some("help") => Ok(CaptureResult {
-            output: "Built-ins: cd [dir], pwd, jobs, fg [id], bg [id], help, exit [code], hash, echo, true, false, unset, local, declare, readonly, shift, eval, alias, unalias, disown, bind, getopts, type, fc, abbr, complete, enable, shopt, trap"
+            output: "Built-ins: cd [dir], pwd, jobs, fg [id], bg [id], help, exit [code], hash, echo, true, false, unset, local, declare, readonly, shift, eval, alias, unalias, disown, bind, getopts, type, fc, abbr, complete, enable, shopt, trap, return"
                 .to_string(),
             status_code: 0,
         }),
@@ -992,6 +1024,30 @@ fn handle_declare(state: &mut ShellState, args: &[String]) -> io::Result<()> {
         state.last_status = 2;
         return Ok(());
     }
+    if args[1] == "-f" {
+        if args.len() == 2 {
+            let mut names: Vec<_> = state.functions.keys().cloned().collect();
+            names.sort();
+            for name in names {
+                if let Some(body) = state.functions.get(&name) {
+                    println!("{}", format_function_definition(&name, body));
+                }
+            }
+            state.last_status = 0;
+            return Ok(());
+        }
+        let mut failed = false;
+        for name in &args[2..] {
+            if let Some(body) = state.functions.get(name) {
+                println!("{}", format_function_definition(name, body));
+            } else {
+                eprintln!("declare: function not found '{name}'");
+                failed = true;
+            }
+        }
+        state.last_status = if failed { 1 } else { 0 };
+        return Ok(());
+    }
     if args[1] != "-A" {
         eprintln!("declare: only -A is supported");
         state.last_status = 2;
@@ -1036,6 +1092,42 @@ fn handle_declare(state: &mut ShellState, args: &[String]) -> io::Result<()> {
     }
     state.last_status = if failed { 2 } else { 0 };
     Ok(())
+}
+
+fn handle_return(state: &mut ShellState, args: &[String]) -> io::Result<()> {
+    if !state.in_local_scope() {
+        eprintln!("return: only valid inside a function");
+        state.last_status = 2;
+        return Ok(());
+    }
+    let code = if let Some(arg) = args.get(1) {
+        match arg.parse::<i32>() {
+            Ok(code) => code,
+            Err(_) => {
+                eprintln!("return: numeric argument required");
+                state.last_status = 2;
+                return Ok(());
+            }
+        }
+    } else {
+        state.last_status
+    };
+    state.last_status = code;
+    state.return_requested = Some(code);
+    Ok(())
+}
+
+fn format_function_definition(name: &str, body: &[String]) -> String {
+    let rendered = body
+        .iter()
+        .map(|tok| token_str(tok))
+        .collect::<Vec<_>>()
+        .join(" ");
+    if rendered.is_empty() {
+        format!("{name} () {{ }}")
+    } else {
+        format!("{name} () {{ {rendered} }}")
+    }
 }
 
 fn handle_enable(state: &mut ShellState, args: &[String], output: &mut String) -> io::Result<()> {

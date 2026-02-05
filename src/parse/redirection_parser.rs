@@ -8,6 +8,23 @@ pub(crate) fn apply_redirection(
     op: &str,
     iter: &mut std::iter::Peekable<std::vec::IntoIter<String>>,
 ) -> Result<(), String> {
+    if let Some(fd) = parse_fd_output_op(op) {
+        if fd == 1 || fd == 2 {
+            // Let the explicit cases below handle standard fds.
+        } else {
+            let target = iter
+                .next()
+                .ok_or_else(|| "missing output file".to_string())?;
+            if let Some((_dup, close)) = parse_dup_target(&target)? {
+                if close {
+                    current.close_fds.push(fd);
+                    return Ok(());
+                }
+                return Err("unsupported fd redirection".to_string());
+            }
+            return Err("unsupported fd redirection".to_string());
+        }
+    }
     match op {
         "<" | "0<" => {
             let path = iter
@@ -136,6 +153,17 @@ fn parse_dup_target(target: &str) -> Result<Option<(i32, bool)>, String> {
         return Ok(Some((fd, false)));
     }
     Err("invalid fd redirection".to_string())
+}
+
+fn parse_fd_output_op(op: &str) -> Option<i32> {
+    let (digits, op_tail) = op.split_at(op.chars().take_while(|c| c.is_ascii_digit()).count());
+    if digits.is_empty() {
+        return None;
+    }
+    if op_tail == ">" || op_tail == ">>" {
+        return digits.parse::<i32>().ok();
+    }
+    None
 }
 
 pub(crate) fn try_parse_sandbox_directive(

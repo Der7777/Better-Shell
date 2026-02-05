@@ -4,6 +4,7 @@ use std::os::fd::{FromRawFd, IntoRawFd};
 use std::os::unix::process::CommandExt;
 use std::process::{ChildStdout, Command, Stdio};
 
+use nix::errno::Errno;
 use nix::unistd::{close, dup2, pipe, write};
 
 use crate::parse::{CommandSpec, OutputRedirection};
@@ -78,6 +79,24 @@ pub(crate) fn apply_stderr_redirection(command: &mut Command, cmd: &CommandSpec)
         let file = opts.open(&err.path)?;
         command.stderr(Stdio::from(file));
     }
+    Ok(())
+}
+
+pub(crate) fn apply_fd_closures(command: &mut Command, cmd: &CommandSpec) -> io::Result<()> {
+    if cmd.close_fds.is_empty() {
+        return Ok(());
+    }
+    let fds = cmd.close_fds.clone();
+    set_pre_exec(command, move || {
+        for fd in &fds {
+            match close(*fd) {
+                Ok(()) => {}
+                Err(Errno::EBADF) => {}
+                Err(err) => return Err(io::Error::other(err.to_string())),
+            }
+        }
+        Ok(())
+    });
     Ok(())
 }
 

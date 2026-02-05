@@ -60,6 +60,7 @@ pub(crate) struct ShellState {
     pub(crate) command_hash: HashMap<String, String>,
     pub(crate) readonly_vars: std::collections::HashSet<String>,
     pub(crate) positional_stack: Vec<Vec<String>>,
+    pub(crate) function_scopes: Vec<HashMap<String, Option<Vec<String>>>>,
     pub(crate) bindings: HashMap<String, String>,
     pub(crate) coprocs: HashMap<String, Coprocess>,
     pub(crate) jobs: Vec<Job>,
@@ -81,6 +82,7 @@ pub(crate) struct ShellState {
     pub(crate) traps: HashMap<String, String>,
     pub(crate) in_debug_trap: bool,
     pub(crate) in_return_trap: bool,
+    pub(crate) return_requested: Option<i32>,
     pub(crate) sandbox: SandboxConfig,
     pub(crate) local_scopes: Vec<HashMap<String, Option<String>>>,
 }
@@ -130,6 +132,7 @@ pub(crate) fn init_state(
         command_hash: HashMap::new(),
         readonly_vars: std::collections::HashSet::new(),
         positional_stack: Vec::new(),
+        function_scopes: Vec::new(),
         bindings: HashMap::new(),
         coprocs: HashMap::new(),
         jobs: Vec::new(),
@@ -150,6 +153,7 @@ pub(crate) fn init_state(
         traps: HashMap::new(),
         in_debug_trap: false,
         in_return_trap: false,
+        return_requested: None,
         sandbox: SandboxConfig::default(),
         local_scopes: Vec::new(),
     };
@@ -196,6 +200,35 @@ impl ShellState {
                     None => env::remove_var(&name),
                 }
             }
+        }
+    }
+
+    pub(crate) fn push_function_scope(&mut self) {
+        self.function_scopes.push(HashMap::new());
+    }
+
+    pub(crate) fn pop_function_scope(&mut self) {
+        if let Some(scope) = self.function_scopes.pop() {
+            for (name, prior) in scope {
+                match prior {
+                    Some(tokens) => {
+                        self.functions.insert(name, tokens);
+                    }
+                    None => {
+                        self.functions.remove(&name);
+                    }
+                }
+            }
+        }
+    }
+
+    pub(crate) fn register_local_function(&mut self, name: &str) {
+        if let Some(scope) = self.function_scopes.last_mut() {
+            if scope.contains_key(name) {
+                return;
+            }
+            let prior = self.functions.get(name).cloned();
+            scope.insert(name.to_string(), prior);
         }
     }
 
@@ -506,6 +539,9 @@ pub(crate) fn execute_segment(
     tokens: Vec<String>,
     display: &str,
 ) -> io::Result<()> {
+    if state.return_requested.is_some() {
+        return Ok(());
+    }
     run_debug_trap(state)?;
     let tokens = apply_abbreviations(tokens, &state.abbreviations);
     let tokens = apply_aliases(tokens, &state.aliases);
@@ -688,6 +724,9 @@ fn execute_segment_lenient(
     tokens: Vec<String>,
     display: &str,
 ) -> io::Result<()> {
+    if state.return_requested.is_some() {
+        return Ok(());
+    }
     run_debug_trap(state)?;
     let tokens = apply_abbreviations(tokens, &state.abbreviations);
     let tokens = apply_aliases(tokens, &state.aliases);

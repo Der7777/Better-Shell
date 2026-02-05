@@ -86,6 +86,9 @@ pub(crate) fn execute_script_tokens(state: &mut ShellState, tokens: Vec<String>)
     };
 
     for segment in segments {
+        if state.return_requested.is_some() {
+            break;
+        }
         let should_run = match segment.op {
             SeqOp::Always => true,
             SeqOp::And => state.last_status == 0,
@@ -93,6 +96,9 @@ pub(crate) fn execute_script_tokens(state: &mut ShellState, tokens: Vec<String>)
         };
         if should_run {
             execute_segment(state, segment.tokens, &segment.display)?;
+            if state.return_requested.is_some() {
+                break;
+            }
         }
     }
 
@@ -105,6 +111,7 @@ pub(crate) fn execute_function(
     args: &[String],
 ) -> io::Result<()> {
     state.push_local_scope();
+    state.push_function_scope();
     state.push_positional(args.to_vec());
     let glob_options = GlobOptions {
         extglob: state.extglob,
@@ -184,6 +191,9 @@ pub(crate) fn execute_function(
         };
 
         for segment in segments {
+            if state.return_requested.is_some() {
+                break;
+            }
             let should_run = match segment.op {
                 SeqOp::Always => true,
                 SeqOp::And => state.last_status == 0,
@@ -191,15 +201,22 @@ pub(crate) fn execute_function(
             };
             if should_run {
                 execute_segment(state, segment.tokens, &segment.display)?;
+                if state.return_requested.is_some() {
+                    break;
+                }
             }
         }
 
         Ok(())
     })();
+    if let Some(code) = state.return_requested.take() {
+        state.last_status = code;
+    }
     if let Err(err) = run_return_trap(state) {
         eprintln!("{err}");
     }
     state.pop_positional();
+    state.pop_function_scope();
     state.pop_local_scope();
     result
 }

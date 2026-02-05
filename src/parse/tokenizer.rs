@@ -227,7 +227,6 @@ fn parse_line_with_mode(input: &str, lenient: bool) -> Result<Vec<String>, Strin
                         args.push(buf.clone());
                         buf.clear();
                         in_token = false;
-                        expect_redir_target = false;
                     }
                     if matches!(chars.peek(), Some('|')) {
                         chars.next();
@@ -323,6 +322,11 @@ fn parse_line_with_mode(input: &str, lenient: bool) -> Result<Vec<String>, Strin
                     expect_redir_target = true;
                 }
                 '&' => {
+                    if expect_redir_target && !in_token {
+                        in_token = true;
+                        buf.push('&');
+                        continue;
+                    }
                     if in_token {
                         args.push(buf.clone());
                         buf.clear();

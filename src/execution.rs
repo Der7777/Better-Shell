@@ -35,6 +35,7 @@ use spawning::build_pipeline_command;
 pub struct ForegroundResult {
     pub outcome: WaitOutcome,
     pub status_code: Option<i32>,
+    #[allow(dead_code)]
     pub pipefail_status: Option<i32>,
     pub pgid: i32,
     pub last_pid: i32,
@@ -53,7 +54,6 @@ pub struct BuiltinPipeResult {
 pub struct BuiltinPipeCaptureResult {
     pub output: String,
     pub status_code: i32,
-    #[allow(dead_code)]
     pub pipefail_status: i32,
 }
 
