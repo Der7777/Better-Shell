@@ -1,5 +1,4 @@
 use std::io;
-use std::os::unix::process::CommandExt;
 use std::process::Command;
 
 use crate::parse::{CommandSpec, SandboxDirective};
@@ -150,6 +149,7 @@ pub(crate) fn apply_sandbox(command: &mut Command, options: &SandboxOptions) -> 
     }
 }
 
+#[cfg(feature = "sandbox")]
 fn set_pre_exec<F>(command: &mut Command, f: F)
 where
     F: FnMut() -> io::Result<()> + Send + Sync + 'static,

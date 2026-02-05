@@ -165,11 +165,11 @@ pub(crate) fn input_redirection_count(cmd: &CommandSpec) -> usize {
 mod tests {
     use super::*;
     use crate::parse::HeredocSpec;
-    use super::spawning::build_command;
     use tempfile::tempdir;
 
     fn run_cat_with_spec(spec: CommandSpec) -> io::Result<String> {
-        let mut command = build_command(&spec)?;
+        let mut command = Command::new(&spec.args[0]);
+        command.args(&spec.args[1..]);
         command.stdout(Stdio::piped());
         let child = command.spawn()?;
         let output = child.wait_with_output()?;

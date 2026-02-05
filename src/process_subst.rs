@@ -1,11 +1,14 @@
 use std::io;
+use std::os::fd::IntoRawFd;
 use std::os::unix::io::RawFd;
 use std::sync::Arc;
 
 use nix::unistd::{close, pipe};
 
 use crate::execution::{spawn_pipeline_background, SandboxConfig};
-use crate::expansion::{expand_globs, expand_tokens};
+use crate::builtins::is_builtin_enabled_map;
+use crate::expansion::{expand_globs_with, expand_tokens};
+use crate::expansion::GlobOptions;
 use crate::job_control::wait_for_process_group;
 use crate::parse::{parse_line, parse_line_lenient, split_pipeline, split_sequence, SeqOp};
 use crate::{build_expansion_context};
@@ -29,6 +32,9 @@ pub fn apply_process_subst(
     trace: bool,
     sandbox: SandboxConfig,
     arrays: std::collections::HashMap<String, Vec<String>>,
+    assoc_arrays: std::collections::HashMap<String, std::collections::HashMap<String, String>>,
+    builtin_enabled: std::collections::HashMap<String, bool>,
+    glob_options: GlobOptions,
     strict: bool,
 ) -> io::Result<ProcessSubstResult> {
     let mut out = Vec::with_capacity(tokens.len());
@@ -37,6 +43,8 @@ pub fn apply_process_subst(
     for token in tokens {
         if let Some((kind, inner)) = parse_process_subst_token(&token) {
             let (read_fd, write_fd) = pipe().map_err(|err| io::Error::other(err.to_string()))?;
+            let read_fd = read_fd.into_raw_fd();
+            let write_fd = write_fd.into_raw_fd();
             let (path_fd, child_fd, keep_fd) = match kind {
                 SubstKind::Input => (read_fd, write_fd, read_fd),
                 SubstKind::Output => (write_fd, read_fd, write_fd),
@@ -48,6 +56,9 @@ pub fn apply_process_subst(
                 trace,
                 sandbox.clone(),
                 arrays.clone(),
+                assoc_arrays.clone(),
+                builtin_enabled.clone(),
+                glob_options,
                 strict,
                 child_fd,
                 kind,
@@ -91,6 +102,9 @@ fn build_subst_pipeline(
     trace: bool,
     sandbox: SandboxConfig,
     arrays: std::collections::HashMap<String, Vec<String>>,
+    assoc_arrays: std::collections::HashMap<String, std::collections::HashMap<String, String>>,
+    builtin_enabled: std::collections::HashMap<String, bool>,
+    glob_options: GlobOptions,
     strict: bool,
     fd: RawFd,
     kind: SubstKind,
@@ -106,12 +120,15 @@ fn build_subst_pipeline(
         trace,
         sandbox.clone(),
         arrays,
+        assoc_arrays,
+        builtin_enabled.clone(),
+        glob_options,
         &[],
         strict,
     );
     let expanded = expand_tokens(tokens, &ctx)
         .map_err(|msg| io::Error::new(io::ErrorKind::InvalidInput, msg))?;
-    let expanded = expand_globs(expanded)
+    let expanded = expand_globs_with(expanded, glob_options)
         .map_err(|msg| io::Error::new(io::ErrorKind::InvalidInput, msg))?;
     let segments = split_sequence(expanded)
         .map_err(|msg| io::Error::new(io::ErrorKind::InvalidInput, msg))?;
@@ -129,7 +146,9 @@ fn build_subst_pipeline(
             "background jobs not supported in process substitution",
         ));
     }
-    if pipeline.iter().any(|cmd| crate::builtins::is_builtin(cmd.args.first().map(String::as_str)))
+    if pipeline
+        .iter()
+        .any(|cmd| is_builtin_enabled_map(&builtin_enabled, cmd.args.first().map(String::as_str)))
     {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,

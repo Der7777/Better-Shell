@@ -45,7 +45,7 @@ pub fn read_heredoc(
                     "Heredoc reader not available in non-interactive mode".to_string(),
                 )
                 .with_context("Cannot read heredoc content interactively")
-                .into());
+                .to_string());
             };
             match editor.readline("> ") {
                 Ok(line) => {
@@ -61,21 +61,21 @@ pub fn read_heredoc(
                         format!("Unexpected EOF while reading heredoc (expected delimiter: {})", delimiter),
                     )
                     .with_context("Heredoc was not terminated with expected delimiter")
-                    .into());
+                    .to_string());
                 }
                 Err(ReadlineError::Interrupted) => {
                     return Err(ShellError::new(
                         ErrorKind::Parse,
                         "Heredoc input interrupted (Ctrl-C)".to_string(),
                     )
-                    .into());
+                    .to_string());
                 }
                 Err(err) => {
                     return Err(ShellError::new(
                         ErrorKind::Parse,
                         format!("Error reading heredoc: {}", err),
                     )
-                    .into());
+                    .to_string());
                 }
             }
         } else {
@@ -87,7 +87,7 @@ pub fn read_heredoc(
                         ErrorKind::Parse,
                         format!("Error reading heredoc from stdin: {}", err),
                     )
-                    .into()
+                    .to_string()
                 })?;
             if bytes == 0 {
                 return Err(ShellError::new(
@@ -95,7 +95,7 @@ pub fn read_heredoc(
                     format!("Unexpected EOF while reading heredoc (expected delimiter: {})", delimiter),
                 )
                 .with_context("Heredoc was not terminated with expected delimiter")
-                .into());
+                .to_string());
             }
             let trimmed = line.trim_end_matches(&['\n', '\r'][..]);
             if trimmed == delimiter {

@@ -147,6 +147,7 @@ dependencies = [
  "nix 0.28.0",
  "portable-pty",
  "proptest",
+ "regex",
  "rustyline",
  "serial_test",
  "signal-hook",

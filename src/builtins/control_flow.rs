@@ -1,13 +1,22 @@
+use std::fs;
 use std::io;
+use std::os::unix::fs::OpenOptionsExt;
 use std::sync::Arc;
 
 use glob::Pattern;
 
-use crate::expansion::{expand_globs, expand_tokens};
+use crate::expansion::{expand_globs_with, expand_tokens};
+use crate::expansion::GlobOptions;
 use crate::io_helpers::read_input_line;
-use crate::parse::{parse_line, token_str, OPERATOR_TOKEN_MARKER};
+use crate::execution::spawn_pipeline_background;
+use crate::parse::{
+    parse_line, split_pipeline, split_sequence, token_str, OutputRedirection, SeqOp,
+    OPERATOR_TOKEN_MARKER,
+};
 use crate::process_subst::{apply_process_subst, FdGuard, ProcessSubstResult};
 use crate::{build_expansion_context, trace_tokens, ShellState};
+use nix::sys::stat::Mode;
+use nix::unistd::mkfifo;
 
 use super::scripting::execute_script_tokens;
 
@@ -20,6 +29,7 @@ pub(crate) enum CompoundKind {
     Case,
     Function,
     Brace,
+    Coproc,
 }
 
 pub(crate) fn is_if_start(tokens: &[String]) -> bool {
@@ -40,6 +50,10 @@ pub(crate) fn is_select_start(tokens: &[String]) -> bool {
 
 pub(crate) fn is_case_start(tokens: &[String]) -> bool {
     tokens.first().map(String::as_str) == Some("case")
+}
+
+pub(crate) fn is_coproc_start(tokens: &[String]) -> bool {
+    tokens.first().map(String::as_str) == Some("coproc")
 }
 
 pub(crate) fn is_brace_group_start(tokens: &[String]) -> bool {
@@ -107,7 +121,7 @@ fn needs_more_compound(tokens: &[String], kind: CompoundKind) -> bool {
         CompoundKind::For => for_count > 0,
         CompoundKind::Select => select_count > 0,
         CompoundKind::Case => case_count > 0,
-        CompoundKind::Function | CompoundKind::Brace => brace_count > 0,
+        CompoundKind::Function | CompoundKind::Brace | CompoundKind::Coproc => brace_count > 0,
     }
 }
 
@@ -149,16 +163,32 @@ pub(crate) fn execute_for(
     _display: &str,
 ) -> io::Result<()> {
     let (var, list_tokens, body_tokens) = parse_for_tokens(tokens)?;
-    let ctx = build_expansion_context(
-        Arc::clone(&state.fg_pgid),
-        state.trace,
-        state.sandbox.clone(),
-        state.arrays.clone(),
-        &[],
-        true,
-    );
-    let list_expanded = expand_tokens(list_tokens, &ctx)?;
-    let list = expand_globs(list_expanded)?;
+    let glob_options = GlobOptions {
+        extglob: state.extglob,
+        nullglob: state.nullglob,
+        failglob: state.failglob,
+        dotglob: state.dotglob,
+        nocaseglob: state.nocaseglob,
+        dirspell: state.dirspell,
+    };
+    let positional = state.current_positional().to_vec();
+    let list = {
+        let ctx = build_expansion_context(
+            Arc::clone(&state.fg_pgid),
+            state.trace,
+            state.sandbox.clone(),
+            state.arrays.clone(),
+            state.assoc_arrays.clone(),
+            state.builtin_enabled.clone(),
+            glob_options,
+            &positional,
+            true,
+        );
+        let list_expanded = expand_tokens(list_tokens, &ctx)
+            .map_err(|msg| io::Error::new(io::ErrorKind::InvalidInput, msg))?;
+        expand_globs_with(list_expanded, glob_options)
+            .map_err(|msg| io::Error::new(io::ErrorKind::InvalidInput, msg))?
+    };
     for item in list {
         std::env::set_var(&var, item);
         execute_script_tokens(state, body_tokens.clone())?;
@@ -172,26 +202,43 @@ pub(crate) fn execute_select(
     _display: &str,
 ) -> io::Result<()> {
     let (var, list_tokens, body_tokens) = parse_select_tokens(tokens)?;
-    let ctx = build_expansion_context(
-        Arc::clone(&state.fg_pgid),
-        state.trace,
-        state.sandbox.clone(),
-        state.arrays.clone(),
-        &[],
-        true,
-    );
-    let expanded = expand_tokens(list_tokens, &ctx)
-        .map_err(|msg| io::Error::new(io::ErrorKind::InvalidInput, msg))?;
+    let glob_options = GlobOptions {
+        extglob: state.extglob,
+        nullglob: state.nullglob,
+        failglob: state.failglob,
+        dotglob: state.dotglob,
+        nocaseglob: state.nocaseglob,
+        dirspell: state.dirspell,
+    };
+    let positional = state.current_positional().to_vec();
+    let expanded = {
+        let ctx = build_expansion_context(
+            Arc::clone(&state.fg_pgid),
+            state.trace,
+            state.sandbox.clone(),
+            state.arrays.clone(),
+            state.assoc_arrays.clone(),
+            state.builtin_enabled.clone(),
+            glob_options,
+            &positional,
+            true,
+        );
+        expand_tokens(list_tokens, &ctx)
+            .map_err(|msg| io::Error::new(io::ErrorKind::InvalidInput, msg))?
+    };
     let ProcessSubstResult { tokens: expanded, keep_fds } = apply_process_subst(
         expanded,
         Arc::clone(&state.fg_pgid),
         state.trace,
         state.sandbox.clone(),
         state.arrays.clone(),
+        state.assoc_arrays.clone(),
+        state.builtin_enabled.clone(),
+        glob_options,
         true,
     )?;
     let _fd_guard = FdGuard(keep_fds);
-    let items = expand_globs(expanded)
+    let items = expand_globs_with(expanded, glob_options)
         .map_err(|msg| io::Error::new(io::ErrorKind::InvalidInput, msg))?;
     let ps3 = std::env::var("PS3").unwrap_or_else(|_| "#? ".to_string());
 
@@ -247,6 +294,148 @@ pub(crate) fn execute_brace_group(
     execute_script_tokens(state, inner)
 }
 
+pub(crate) fn execute_coproc(
+    state: &mut ShellState,
+    tokens: Vec<String>,
+    display: &str,
+) -> io::Result<()> {
+    let (name, body_tokens) = parse_coproc_tokens(tokens)?;
+    if !crate::utils::is_valid_var_name(&name) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("coproc: invalid name '{name}'"),
+        ));
+    }
+    if state.coprocs.contains_key(&name) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("coproc: '{name}' already exists"),
+        ));
+    }
+
+    let glob_options = GlobOptions {
+        extglob: state.extglob,
+        nullglob: state.nullglob,
+        failglob: state.failglob,
+        dotglob: state.dotglob,
+        nocaseglob: state.nocaseglob,
+        dirspell: state.dirspell,
+    };
+    let positional = state.current_positional().to_vec();
+    let ctx = build_expansion_context(
+        Arc::clone(&state.fg_pgid),
+        state.trace,
+        state.sandbox.clone(),
+        state.arrays.clone(),
+        state.assoc_arrays.clone(),
+        state.builtin_enabled.clone(),
+        glob_options,
+        &positional,
+        true,
+    );
+    let expanded = expand_tokens(body_tokens, &ctx)
+        .map_err(|msg| io::Error::new(io::ErrorKind::InvalidInput, msg))?;
+    let ProcessSubstResult { tokens: expanded, keep_fds } = apply_process_subst(
+        expanded,
+        Arc::clone(&state.fg_pgid),
+        state.trace,
+        state.sandbox.clone(),
+        state.arrays.clone(),
+        state.assoc_arrays.clone(),
+        state.builtin_enabled.clone(),
+        glob_options,
+        true,
+    )?;
+    let _fd_guard = FdGuard(keep_fds);
+    let expanded = expand_globs_with(expanded, glob_options)
+        .map_err(|msg| io::Error::new(io::ErrorKind::InvalidInput, msg))?;
+    let segments = split_sequence(expanded)
+        .map_err(|msg| io::Error::new(io::ErrorKind::InvalidInput, msg))?;
+    if segments.len() != 1 || !matches!(segments[0].op, SeqOp::Always) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "coproc requires a single command",
+        ));
+    }
+    let (mut pipeline, background) = split_pipeline(segments[0].tokens.clone())
+        .map_err(|msg| io::Error::new(io::ErrorKind::InvalidInput, msg))?;
+    if background {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "coproc does not allow background jobs",
+        ));
+    }
+    if pipeline.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "coproc requires a command",
+        ));
+    }
+    if pipeline[0].stdin.is_some() || pipeline[0].heredoc.is_some() || pipeline[0].herestring.is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "coproc does not allow stdin redirection",
+        ));
+    }
+    if pipeline.last().and_then(|cmd| cmd.stdout.as_ref()).is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "coproc does not allow stdout redirection",
+        ));
+    }
+
+    let id = state.next_coproc_id;
+    state.next_coproc_id += 1;
+    let base = format!("/tmp/custom_shell_coproc_{name}_{id}");
+    let in_path = format!("{base}_in");
+    let out_path = format!("{base}_out");
+    let _ = fs::remove_file(&in_path);
+    let _ = fs::remove_file(&out_path);
+    mkfifo(in_path.as_str(), Mode::from_bits_truncate(0o600))
+        .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?;
+    mkfifo(out_path.as_str(), Mode::from_bits_truncate(0o600))
+        .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?;
+
+    let in_hold = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_CLOEXEC)
+        .open(&in_path)?;
+    let out_hold = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_CLOEXEC)
+        .open(&out_path)?;
+
+    pipeline[0].stdin = Some(in_path.clone());
+    if let Some(last) = pipeline.last_mut() {
+        last.stdout = Some(OutputRedirection {
+            path: out_path.clone(),
+            append: false,
+        });
+    }
+
+    let (pgid, last_pid) = spawn_pipeline_background(&pipeline, state.trace, &state.sandbox)?;
+    std::env::set_var(format!("{name}_PID"), last_pid.to_string());
+    let mut assoc = std::collections::HashMap::new();
+    assoc.insert("PIP".to_string(), format!("{in_path} {out_path}"));
+    state.set_assoc_array(&name, assoc);
+    state.coprocs.insert(
+        name,
+        crate::job_control::Coprocess {
+            pid: last_pid,
+            pgid,
+            command: display.to_string(),
+            in_path,
+            out_path,
+            in_hold,
+            out_hold,
+        },
+    );
+    state.last_status = 0;
+    Ok(())
+}
+
 struct CaseClause {
     patterns: Vec<Vec<String>>,
     body: Vec<String>,
@@ -258,12 +447,24 @@ pub(crate) fn execute_case(
     display: &str,
 ) -> io::Result<()> {
     let (word_tokens, clauses) = parse_case_tokens(tokens)?;
+    let glob_options = GlobOptions {
+        extglob: state.extglob,
+        nullglob: state.nullglob,
+        failglob: state.failglob,
+        dotglob: state.dotglob,
+        nocaseglob: state.nocaseglob,
+        dirspell: state.dirspell,
+    };
+    let positional = state.current_positional().to_vec();
     let ctx = build_expansion_context(
         Arc::clone(&state.fg_pgid),
         state.trace,
         state.sandbox.clone(),
         state.arrays.clone(),
-        &[],
+        state.assoc_arrays.clone(),
+        state.builtin_enabled.clone(),
+        glob_options,
+        &positional,
         true,
     );
     let word_expanded = match expand_tokens(word_tokens, &ctx) {
@@ -524,6 +725,41 @@ fn parse_select_tokens(tokens: Vec<String>) -> io::Result<(String, Vec<String>, 
         ));
     }
     Ok((var, list, body))
+}
+
+fn parse_coproc_tokens(tokens: Vec<String>) -> io::Result<(String, Vec<String>)> {
+    if tokens.len() < 4 || tokens[0] != "coproc" {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid coproc statement",
+        ));
+    }
+    let name = tokens
+        .get(1)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "coproc name missing"))?
+        .to_string();
+    let brace_pos = tokens
+        .iter()
+        .position(|t| t == "{")
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "coproc missing {"))?;
+    let mut depth = 0i32;
+    let mut end_pos = None;
+    for (idx, tok) in tokens.iter().enumerate().skip(brace_pos) {
+        let t = token_str(tok);
+        if t == "{" {
+            depth += 1;
+        } else if t == "}" {
+            depth -= 1;
+            if depth == 0 {
+                end_pos = Some(idx);
+                break;
+            }
+        }
+    }
+    let end_pos =
+        end_pos.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "coproc missing }"))?;
+    let body = tokens[brace_pos + 1..end_pos].to_vec();
+    Ok((name, body))
 }
 
 fn parse_case_tokens(tokens: Vec<String>) -> io::Result<(Vec<String>, Vec<CaseClause>)> {

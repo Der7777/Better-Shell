@@ -5,9 +5,10 @@ use std::sync::{
     Arc,
 };
 
-use crate::builtins::{execute_builtin_substitution_capture, is_builtin};
+use crate::builtins::{execute_builtin_substitution_capture, is_builtin_enabled_map};
 use crate::execution::{builtin_pipe_capture, run_pipeline_capture, SandboxConfig};
-use crate::expansion::{expand_globs, expand_tokens, ExpansionContext};
+use crate::expansion::{expand_globs_with, expand_tokens, ExpansionContext};
+use crate::expansion::GlobOptions;
 use crate::io_helpers::normalize_command_output;
 use crate::parse::{
     parse_line, parse_line_lenient, split_pipeline, split_sequence, SeqOp, SeqSegment,
@@ -20,6 +21,9 @@ fn execute_command_substitution(
     trace: bool,
     sandbox: SandboxConfig,
     arrays: std::collections::HashMap<String, Vec<String>>,
+    assoc_arrays: std::collections::HashMap<String, std::collections::HashMap<String, String>>,
+    builtin_enabled: std::collections::HashMap<String, bool>,
+    glob_options: GlobOptions,
     strict: bool,
 ) -> Result<String, String> {
     let tokens = if strict {
@@ -35,6 +39,9 @@ fn execute_command_substitution(
         trace,
         sandbox.clone(),
         arrays.clone(),
+        assoc_arrays.clone(),
+        builtin_enabled.clone(),
+        glob_options,
         &[],
         strict,
     );
@@ -45,6 +52,9 @@ fn execute_command_substitution(
         trace,
         &sandbox,
         arrays.clone(),
+        assoc_arrays.clone(),
+        builtin_enabled.clone(),
+        glob_options,
         strict,
     )?;
     if segments.is_empty() {
@@ -55,6 +65,7 @@ fn execute_command_substitution(
         fg_pgid,
         trace,
         &sandbox,
+        builtin_enabled,
         "background jobs not allowed in command substitution",
         "command substitution failed",
     )
@@ -66,6 +77,9 @@ pub(crate) fn execute_tokens_capture(
     trace: bool,
     sandbox: SandboxConfig,
     arrays: std::collections::HashMap<String, Vec<String>>,
+    assoc_arrays: std::collections::HashMap<String, std::collections::HashMap<String, String>>,
+    builtin_enabled: std::collections::HashMap<String, bool>,
+    glob_options: GlobOptions,
     strict: bool,
 ) -> Result<String, String> {
     // Capture mode forbids background jobs to keep substitutions deterministic.
@@ -74,6 +88,9 @@ pub(crate) fn execute_tokens_capture(
         trace,
         sandbox.clone(),
         arrays.clone(),
+        assoc_arrays.clone(),
+        builtin_enabled.clone(),
+        glob_options,
         &[],
         strict,
     );
@@ -84,6 +101,9 @@ pub(crate) fn execute_tokens_capture(
         trace,
         &sandbox,
         arrays.clone(),
+        assoc_arrays.clone(),
+        builtin_enabled.clone(),
+        glob_options,
         strict,
     )?;
     if segments.is_empty() {
@@ -94,6 +114,7 @@ pub(crate) fn execute_tokens_capture(
         &fg_pgid,
         trace,
         &sandbox,
+        builtin_enabled,
         "background jobs not allowed in prompt function",
         "prompt function failed",
     )
@@ -106,6 +127,9 @@ fn expand_and_split_tokens(
     trace: bool,
     sandbox: &SandboxConfig,
     arrays: std::collections::HashMap<String, Vec<String>>,
+    assoc_arrays: std::collections::HashMap<String, std::collections::HashMap<String, String>>,
+    builtin_enabled: std::collections::HashMap<String, bool>,
+    glob_options: GlobOptions,
     strict: bool,
 ) -> Result<(Vec<SeqSegment>, FdGuard), String> {
     let expanded = expand_tokens(tokens, ctx)?;
@@ -118,11 +142,14 @@ fn expand_and_split_tokens(
         trace,
         sandbox.clone(),
         arrays,
+        assoc_arrays,
+        builtin_enabled,
+        glob_options,
         strict,
     )
     .map_err(|err| err.to_string())?;
     let fd_guard = FdGuard(keep_fds);
-    let expanded = expand_globs(expanded)?;
+    let expanded = expand_globs_with(expanded, glob_options)?;
     if expanded.is_empty() {
         return Ok((Vec::new(), fd_guard));
     }
@@ -135,6 +162,7 @@ fn execute_segments_capture(
     fg_pgid: &Arc<AtomicI32>,
     trace: bool,
     sandbox: &SandboxConfig,
+    builtin_enabled: std::collections::HashMap<String, bool>,
     background_error: &str,
     failure_context: &str,
 ) -> Result<String, String> {
@@ -156,7 +184,7 @@ fn execute_segments_capture(
         }
         let has_builtin = pipeline
             .iter()
-            .any(|cmd| is_builtin(cmd.args.first().map(String::as_str)));
+            .any(|cmd| is_builtin_enabled_map(&builtin_enabled, cmd.args.first().map(String::as_str)));
         if has_builtin {
             if pipeline.len() == 1 {
                 let result = execute_builtin_substitution_capture(&pipeline[0], None)?;
@@ -166,7 +194,7 @@ fn execute_segments_capture(
             }
             let result = builtin_pipe_capture(
                 &pipeline,
-                |cmd| is_builtin(cmd.args.first().map(String::as_str)),
+                |cmd| is_builtin_enabled_map(&builtin_enabled, cmd.args.first().map(String::as_str)),
                 |cmd, stdin| {
                     execute_builtin_substitution_capture(cmd, stdin)
                         .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))
@@ -188,16 +216,22 @@ fn execute_segments_capture(
     Ok(normalize_command_output(output))
 }
 
-pub(crate) fn build_expansion_context(
+pub(crate) fn build_expansion_context<'a>(
     fg_pgid: Arc<AtomicI32>,
     trace: bool,
     sandbox: SandboxConfig,
     arrays: std::collections::HashMap<String, Vec<String>>,
-    positional: &'static [String],
+    assoc_arrays: std::collections::HashMap<String, std::collections::HashMap<String, String>>,
+    builtin_enabled: std::collections::HashMap<String, bool>,
+    glob_options: GlobOptions,
+    positional: &'a [String],
     strict: bool,
-) -> ExpansionContext<'static> {
+) -> ExpansionContext<'a> {
     let arrays_for_lookup = arrays.clone();
     let arrays_for_subst = arrays.clone();
+    let assoc_for_lookup = assoc_arrays.clone();
+    let assoc_for_subst = assoc_arrays.clone();
+    let builtins_for_subst = builtin_enabled.clone();
     ExpansionContext {
         // Static slice keeps closures simple for expansion usage sites.
         lookup_var: Box::new(move |name| {
@@ -214,6 +248,7 @@ pub(crate) fn build_expansion_context(
             }
         }),
         lookup_array: Box::new(move |name| arrays_for_lookup.get(name).cloned()),
+        lookup_assoc: Box::new(move |name| assoc_for_lookup.get(name).cloned()),
         // Boxed closure allows swapping implementations in tests or future shells.
         command_subst: Box::new(move |inner| {
             execute_command_substitution(
@@ -222,6 +257,9 @@ pub(crate) fn build_expansion_context(
                 trace,
                 sandbox.clone(),
                 arrays_for_subst.clone(),
+                assoc_for_subst.clone(),
+                builtins_for_subst.clone(),
+                glob_options,
                 strict,
             )
         }),

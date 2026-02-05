@@ -3,7 +3,7 @@ name = "custom_shell"
 version = "0.1.0"
 edition = "2021"
 
-authors = ["Der"]
+authors = ["Der7777"]
 
 description = "A custom shell in Rust"
 
@@ -14,14 +14,15 @@ env_logger = { version = "0.11", optional = true }
 signal-hook = { version = "0.3", optional = true }
 libc = { version = "0.2", optional = true }
 glob = { version = "0.3", optional = true }
-nix = { version = "0.28", default-features = false, features = ["term", "process", "signal"], optional = true }
+regex = { version = "1", optional = true }
+nix = { version = "0.28", default-features = false, features = ["term", "process", "signal", "fs"], optional = true }
 tree-sitter = { version = "0.20", optional = true }
 tree-sitter-bash = { version = "0.20", optional = true }
 tree-sitter-highlight = { version = "0.20", optional = true }
 
 [features]
 default = ["shell"]
-expansion = ["glob"]
+expansion = ["glob", "regex"]
 shell = ["expansion", "rustyline", "signal-hook", "libc", "nix", "log", "env_logger", "tree-sitter", "tree-sitter-bash", "tree-sitter-highlight"]
 pty-tests = []
 sandbox = []

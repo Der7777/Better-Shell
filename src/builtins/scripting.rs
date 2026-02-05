@@ -1,19 +1,32 @@
 use std::io;
 use std::sync::Arc;
 
-use crate::expansion::{expand_globs, expand_tokens};
+use crate::expansion::{expand_globs_with, expand_tokens};
+use crate::expansion::GlobOptions;
 use crate::process_subst::{apply_process_subst, FdGuard, ProcessSubstResult};
 use crate::parse::{split_sequence, token_str, SeqOp};
 use crate::utils::is_valid_var_name;
-use crate::{build_expansion_context, execute_segment, trace_tokens, ShellState};
+use crate::{build_expansion_context, execute_segment, run_return_trap, trace_tokens, ShellState};
 
 pub(crate) fn execute_script_tokens(state: &mut ShellState, tokens: Vec<String>) -> io::Result<()> {
+    let glob_options = GlobOptions {
+        extglob: state.extglob,
+        nullglob: state.nullglob,
+        failglob: state.failglob,
+        dotglob: state.dotglob,
+        nocaseglob: state.nocaseglob,
+        dirspell: state.dirspell,
+    };
+    let positional = state.current_positional().to_vec();
     let ctx = build_expansion_context(
         Arc::clone(&state.fg_pgid),
         state.trace,
         state.sandbox.clone(),
         state.arrays.clone(),
-        &[],
+        state.assoc_arrays.clone(),
+        state.builtin_enabled.clone(),
+        glob_options,
+        &positional,
         true,
     );
     let expanded = match expand_tokens(tokens, &ctx) {
@@ -38,11 +51,14 @@ pub(crate) fn execute_script_tokens(state: &mut ShellState, tokens: Vec<String>)
         state.trace,
         state.sandbox.clone(),
         state.arrays.clone(),
+        state.assoc_arrays.clone(),
+        state.builtin_enabled.clone(),
+        glob_options,
         true,
     )?;
     let _fd_guard = FdGuard(keep_fds);
 
-    let expanded = match expand_globs(expanded) {
+    let expanded = match expand_globs_with(expanded, glob_options) {
         Ok(v) => v,
         Err(msg) => {
             state.last_status = 2;
@@ -89,12 +105,25 @@ pub(crate) fn execute_function(
     args: &[String],
 ) -> io::Result<()> {
     state.push_local_scope();
+    state.push_positional(args.to_vec());
+    let glob_options = GlobOptions {
+        extglob: state.extglob,
+        nullglob: state.nullglob,
+        failglob: state.failglob,
+        dotglob: state.dotglob,
+        nocaseglob: state.nocaseglob,
+        dirspell: state.dirspell,
+    };
+    let positional = state.current_positional().to_vec();
     let ctx = build_expansion_context(
         Arc::clone(&state.fg_pgid),
         state.trace,
         state.sandbox.clone(),
         state.arrays.clone(),
-        args,
+        state.assoc_arrays.clone(),
+        state.builtin_enabled.clone(),
+        glob_options,
+        &positional,
         true,
     );
     let result = (|| {
@@ -120,11 +149,14 @@ pub(crate) fn execute_function(
         state.trace,
         state.sandbox.clone(),
         state.arrays.clone(),
+        state.assoc_arrays.clone(),
+        state.builtin_enabled.clone(),
+        glob_options,
         true,
     )?;
     let _fd_guard = FdGuard(keep_fds);
 
-    let expanded = match expand_globs(expanded) {
+    let expanded = match expand_globs_with(expanded, glob_options) {
         Ok(v) => v,
         Err(msg) => {
             state.last_status = 2;
@@ -164,6 +196,10 @@ pub(crate) fn execute_function(
 
         Ok(())
     })();
+    if let Err(err) = run_return_trap(state) {
+        eprintln!("{err}");
+    }
+    state.pop_positional();
     state.pop_local_scope();
     result
 }

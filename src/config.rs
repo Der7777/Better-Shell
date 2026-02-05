@@ -7,10 +7,9 @@ use std::path::Path;
 mod parser;
 pub mod sandbox;
 
-use crate::colors::{load_color_lines, ColorConfig};
-use crate::execution::SandboxConfig;
+use crate::colors::ColorConfig;
 use crate::parse::OPERATOR_TOKEN_MARKER;
-use crate::prompt::{parse_prompt_theme, render_prompt_template, render_prompt_theme, PromptTheme};
+use crate::prompt::{render_prompt_template, render_prompt_theme, PromptTheme};
 
 pub use parser::load_config;
 

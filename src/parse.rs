@@ -13,14 +13,12 @@ mod command_parser;
 mod redirection_parser;
 mod tokenizer;
 
-pub use command_parser::{
-    split_pipeline, split_pipeline_lenient, split_sequence, split_sequence_lenient, SeqOp,
-    SeqSegment,
-};
-pub use tokenizer::{
-    parse_command_substitution, parse_command_substitution_lenient, parse_line, parse_line_lenient,
-};
 pub use command_parser::token_str;
+pub use command_parser::{SeqOp, SeqSegment, split_pipeline, split_pipeline_lenient, split_sequence, split_sequence_lenient};
+pub use tokenizer::{
+    parse_line, parse_line_lenient, tokenize_history, HistoryDesignator, HistoryToken,
+};
+pub use tokenizer::{parse_command_substitution, parse_command_substitution_lenient};
 
 #[derive(Debug, Clone)]
 pub struct OutputRedirection {
@@ -91,7 +89,7 @@ pub fn parse_sandbox_value(value: &str) -> Result<SandboxDirective, String> {
             format!("Invalid sandbox value: {}", value),
         )
         .with_context("Valid values: 1/yes/true/on, 0/no/false/off, bwrap, native")
-        .into()),
+        .to_string()),
     }
 }
 

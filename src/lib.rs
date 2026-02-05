@@ -5,10 +5,11 @@
 
 #[cfg(feature = "expansion")]
 mod expansion;
+mod error;
 mod parse;
 mod utils;
 
-pub use parse::{CommandSpec, HeredocSpec, OutputRedirection, SandboxDirective, SeqOp, SeqSegment};
+pub use parse::{CommandSpec, SeqOp, SeqSegment};
 
 /// Tokenize a shell command line into raw tokens.
 pub fn parse_tokens(input: &str) -> Result<Vec<String>, String> {
@@ -35,7 +36,7 @@ pub fn fuzz_parse_bytes(data: &[u8]) {
 }
 
 #[cfg(feature = "expansion")]
-pub use expansion::{expand_globs, expand_token, expand_tokens, glob_pattern, ExpansionContext};
+pub use expansion::{expand_token, expand_tokens, ExpansionContext};
 
 /// Fuzz helper for parser+expansion targets.
 #[cfg(feature = "expansion")]
@@ -44,6 +45,7 @@ pub fn fuzz_expand_bytes(data: &[u8]) {
     let ctx = ExpansionContext {
         lookup_var: Box::new(|_| Some(String::new())),
         lookup_array: Box::new(|_| None),
+        lookup_assoc: Box::new(|_| None),
         command_subst: Box::new(|_| Ok(String::new())),
         positional: &[],
         strict: true,

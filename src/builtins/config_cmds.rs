@@ -1,5 +1,8 @@
-use std::io;
+use std::collections::HashMap;
 use std::fmt::Write;
+use std::io;
+
+use rustyline::history::{History, SearchDirection};
 
 use crate::colors::{apply_color_setting, format_color_lines, resolve_color, save_colors};
 use crate::completions::{
@@ -202,8 +205,8 @@ pub(crate) fn handle_history(
         if let Ok(count) = count_str.parse::<usize>() {
             let history_len = state.editor.history().len();
             for i in (history_len.saturating_sub(count)..history_len).rev() {
-                if let Some(entry) = state.editor.history().get(i) {
-                    let _ = writeln!(output, "{} {}", i, entry);
+                if let Ok(Some(entry)) = state.editor.history().get(i, SearchDirection::Forward) {
+                    let _ = writeln!(output, "{} {}", entry.idx, entry.entry);
                 }
             }
         } else {
@@ -218,4 +221,143 @@ pub(crate) fn handle_history(
     }
     state.last_status = 0;
     Ok(())
+}
+
+pub(crate) fn save_assoc_arrays(
+    assoc_arrays: &HashMap<String, HashMap<String, String>>,
+) -> io::Result<()> {
+    let Some(home) = std::env::var("HOME").ok() else {
+        return Ok(());
+    };
+    let path = format!("{home}/.minishell_assoc");
+    let mut entries: Vec<_> = assoc_arrays.iter().collect();
+    entries.sort_by_key(|(name, _)| *name);
+    let mut out = String::new();
+    for (name, values) in entries {
+        out.push_str(&format_assoc_array_line(name, values));
+        out.push('\n');
+    }
+    std::fs::write(path, out)
+}
+
+pub(crate) fn load_assoc_arrays(state: &mut ShellState) -> io::Result<()> {
+    let Some(home) = std::env::var("HOME").ok() else {
+        return Ok(());
+    };
+    let path = format!("{home}/.minishell_assoc");
+    let content = match std::fs::read_to_string(&path) {
+        Ok(content) => content,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err),
+    };
+    for (idx, raw) in content.lines().enumerate() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let tokens = match parse_line(line) {
+            Ok(tokens) => tokens,
+            Err(msg) => {
+                eprintln!("assoc:{}: parse error: {msg}", idx + 1);
+                continue;
+            }
+        };
+        if tokens.len() < 2 || tokens[0] != "declare" || tokens[1] != "-A" {
+            eprintln!("assoc:{}: expected 'declare -A'", idx + 1);
+            continue;
+        }
+        if tokens.len() == 2 {
+            eprintln!("assoc:{}: missing name", idx + 1);
+            continue;
+        }
+        let args = &tokens[2..];
+        if let Some((name, values)) = parse_assoc_array_literal(args) {
+            if !is_valid_var_name(&name) {
+                eprintln!("assoc:{}: invalid name '{name}'", idx + 1);
+                continue;
+            }
+            state.set_assoc_array(&name, values);
+            continue;
+        }
+        if args.len() == 1 && is_valid_var_name(&args[0]) {
+            state.assoc_arrays.entry(args[0].clone()).or_default();
+            continue;
+        }
+        eprintln!("assoc:{}: invalid declare -A syntax", idx + 1);
+    }
+    Ok(())
+}
+
+fn format_assoc_array_line(name: &str, values: &HashMap<String, String>) -> String {
+    if values.is_empty() {
+        return format!("declare -A {name}");
+    }
+    let mut keys: Vec<_> = values.keys().collect();
+    keys.sort();
+    let mut out = format!("declare -A {name}=(");
+    for (idx, key) in keys.iter().enumerate() {
+        if idx > 0 {
+            out.push(' ');
+        }
+        let value = values.get(*key).map(String::as_str).unwrap_or("");
+        out.push('[');
+        out.push_str(key);
+        out.push_str("]=");
+        out.push_str(value);
+    }
+    out.push(')');
+    out
+}
+
+fn parse_assoc_array_literal(tokens: &[String]) -> Option<(String, HashMap<String, String>)> {
+    let first = tokens.first()?;
+    let eq_pos = first.find("=(")?;
+    let name = first[..eq_pos].to_string();
+    let mut values = HashMap::new();
+    let mut first_val = first[eq_pos + 2..].to_string();
+    if tokens.len() == 1 {
+        if first_val.ends_with(')') {
+            first_val.pop();
+            if !first_val.is_empty() {
+                parse_assoc_literal_item(&first_val, &mut values)?;
+            }
+            return Some((name, values));
+        }
+        return None;
+    }
+    if !first_val.is_empty() {
+        parse_assoc_literal_item(&first_val, &mut values)?;
+    }
+    for token in tokens.iter().skip(1).take(tokens.len() - 2) {
+        parse_assoc_literal_item(token, &mut values)?;
+    }
+    let mut last = tokens.last()?.clone();
+    if !last.ends_with(')') {
+        return None;
+    }
+    last.pop();
+    if !last.is_empty() {
+        parse_assoc_literal_item(&last, &mut values)?;
+    }
+    Some((name, values))
+}
+
+fn parse_assoc_literal_item(
+    token: &str,
+    values: &mut HashMap<String, String>,
+) -> Option<()> {
+    if !token.starts_with('[') {
+        return None;
+    }
+    let close = token.find("]=")?;
+    let key = &token[1..close];
+    if key.is_empty() {
+        return None;
+    }
+    if key.parse::<usize>().is_ok() {
+        return None;
+    }
+    let value = &token[close + 2..];
+    values.insert(key.to_string(), value.to_string());
+    Some(())
 }

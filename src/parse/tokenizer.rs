@@ -23,6 +23,175 @@ pub fn parse_line_lenient(input: &str) -> Result<Vec<String>, String> {
     parse_line_with_mode(input, true)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HistoryDesignator {
+    LastCommand,
+    LastArg,
+    FirstArg,
+    AllArgs,
+    Relative(usize),
+    Prefix(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HistoryToken {
+    Literal(String),
+    Designator(HistoryDesignator),
+}
+
+pub fn tokenize_history(input: &str) -> Result<Vec<HistoryToken>, String> {
+    let mut tokens = Vec::new();
+    let mut buf = String::new();
+    let mut chars = input.chars().peekable();
+    let mut mode = ParseMode::Normal;
+    let mut prev_char: Option<char> = None;
+
+    while let Some(ch) = chars.next() {
+        match mode {
+            ParseMode::Normal => match ch {
+                '\'' => {
+                    buf.push(ch);
+                    mode = ParseMode::Single;
+                }
+                '"' => {
+                    buf.push(ch);
+                    mode = ParseMode::Double;
+                }
+                '\\' => {
+                    if let Some(next) = chars.next() {
+                        buf.push('\\');
+                        buf.push(next);
+                        prev_char = Some(next);
+                        continue;
+                    }
+                    buf.push('\\');
+                }
+                '!' => {
+                    if !is_history_boundary(prev_char) {
+                        buf.push('!');
+                        prev_char = Some('!');
+                        continue;
+                    }
+                    let next = chars.peek().copied();
+                    let mut consumed_last = '!';
+                    let designator = match next {
+                        Some('!') => {
+                            chars.next();
+                            consumed_last = '!';
+                            HistoryDesignator::LastCommand
+                        }
+                        Some('$') => {
+                            chars.next();
+                            consumed_last = '$';
+                            HistoryDesignator::LastArg
+                        }
+                        Some('^') => {
+                            chars.next();
+                            consumed_last = '^';
+                            HistoryDesignator::FirstArg
+                        }
+                        Some('*') => {
+                            chars.next();
+                            consumed_last = '*';
+                            HistoryDesignator::AllArgs
+                        }
+                        Some('-') => {
+                            chars.next();
+                            let mut digits = String::new();
+                            while let Some(d) = chars.peek().copied() {
+                                if d.is_ascii_digit() {
+                                    digits.push(d);
+                                    consumed_last = d;
+                                    chars.next();
+                                } else {
+                                    break;
+                                }
+                            }
+                            if digits.is_empty() {
+                                buf.push('!');
+                                buf.push('-');
+                                prev_char = Some('-');
+                                continue;
+                            }
+                            let value = digits.parse::<usize>().unwrap_or(0);
+                            HistoryDesignator::Relative(value)
+                        }
+                        Some(ch) if !ch.is_whitespace() && !is_boundary_char(ch) => {
+                            let mut prefix = String::new();
+                            while let Some(ch) = chars.peek().copied() {
+                                if ch.is_whitespace() || is_boundary_char(ch) {
+                                    break;
+                                }
+                                prefix.push(ch);
+                                consumed_last = ch;
+                                chars.next();
+                            }
+                            if prefix.is_empty() {
+                                buf.push('!');
+                                prev_char = Some('!');
+                                continue;
+                            }
+                            HistoryDesignator::Prefix(prefix)
+                        }
+                        _ => HistoryDesignator::LastCommand,
+                    };
+
+                    if !buf.is_empty() {
+                        tokens.push(HistoryToken::Literal(std::mem::take(&mut buf)));
+                    }
+                    tokens.push(HistoryToken::Designator(designator));
+                    prev_char = Some(consumed_last);
+                    continue;
+                }
+                _ => {
+                    buf.push(ch);
+                }
+            },
+            ParseMode::Single => {
+                buf.push(ch);
+                if ch == '\'' {
+                    mode = ParseMode::Normal;
+                }
+            }
+            ParseMode::Double => match ch {
+                '"' => {
+                    buf.push(ch);
+                    mode = ParseMode::Normal;
+                }
+                '\\' => {
+                    if let Some(next) = chars.next() {
+                        buf.push('\\');
+                        buf.push(next);
+                        prev_char = Some(next);
+                        continue;
+                    }
+                    buf.push('\\');
+                }
+                _ => {
+                    buf.push(ch);
+                }
+            },
+        }
+        prev_char = Some(ch);
+    }
+
+    if !buf.is_empty() {
+        tokens.push(HistoryToken::Literal(buf));
+    }
+    Ok(tokens)
+}
+
+fn is_history_boundary(prev: Option<char>) -> bool {
+    match prev {
+        None => true,
+        Some(ch) => ch.is_whitespace() || is_boundary_char(ch),
+    }
+}
+
+fn is_boundary_char(ch: char) -> bool {
+    matches!(ch, '|' | '&' | ';' | '(' | ')' | '<' | '>')
+}
+
 fn parse_line_with_mode(input: &str, lenient: bool) -> Result<Vec<String>, String> {
     let mut args = Vec::new();
     let mut buf = String::new();
@@ -331,7 +500,7 @@ fn parse_line_with_mode(input: &str, lenient: bool) -> Result<Vec<String>, Strin
                 format!("Unterminated {} quote", quote_char),
             )
             .with_position(input.len() - 1)
-            .into());
+            .to_string());
         }
         mode = ParseMode::Normal;
     }
@@ -348,7 +517,7 @@ fn parse_line_with_mode(input: &str, lenient: bool) -> Result<Vec<String>, Strin
         )
         .with_context("After >, >>, <, etc.")
         .with_position(input.len() - 1)
-        .into());
+        .to_string());
     }
 
     Ok(args)
@@ -369,7 +538,7 @@ where
             "Unterminated command substitution $(...)",
         )
         .with_context("Missing closing parenthesis for command substitution")
-        .into())
+        .to_string())
     }
 }
 
@@ -386,7 +555,7 @@ where
             "Unterminated backtick command substitution",
         )
         .with_context("Missing closing backtick (`)")
-        .into())
+        .to_string())
     }
 }
 
@@ -444,7 +613,7 @@ where
                             .with_context(
                                 "Consider simplifying: $(cmd1 $(cmd2)) is nested, $(cmd1; cmd2) is not",
                             )
-                            .into());
+                            .to_string());
                         }
                         inner.push_str("$(");
                     } else {
@@ -494,7 +663,7 @@ where
                             .with_context(
                                 "Consider simplifying: $(cmd1 $(cmd2)) is nested, $(cmd1; cmd2) is not",
                             )
-                            .into());
+                            .to_string());
                         }
                         inner.push_str("$(");
                     } else {
@@ -514,7 +683,7 @@ where
             "Unterminated command substitution $(...)",
         )
         .with_context("Missing closing parenthesis for command substitution")
-        .into())
+        .to_string())
     }
 }
 
@@ -558,7 +727,7 @@ where
             "Unterminated backtick command substitution",
         )
         .with_context("Missing closing backtick (`)")
-        .into())
+        .to_string())
     }
 }
 
@@ -654,7 +823,7 @@ mod tests {
     #[test]
     fn redirection_target_lenient_mode_allows_missing() {
         let tokens = parse_line_lenient("echo >").unwrap();
-        assert_eq!(tokens, vec!["echo", format!("{OPERATOR_TOKEN_MARKER}>")]);
+        assert_eq!(tokens, vec!["echo".to_string(), format!("{OPERATOR_TOKEN_MARKER}>")]);
     }
 
     #[test]

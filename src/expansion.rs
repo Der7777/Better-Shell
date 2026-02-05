@@ -5,18 +5,21 @@ use crate::parse::{
     parse_command_substitution, parse_command_substitution_lenient, strip_markers, ESCAPE_MARKER,
     NOGLOB_MARKER, OPERATOR_TOKEN_MARKER,
 };
-use glob::Pattern;
+use ::glob::Pattern;
 use crate::utils::is_valid_var_name;
 
 mod glob;
 
-pub use glob::{expand_globs, glob_pattern};
+#[allow(unused_imports)]
+pub use glob::{expand_globs_with, GlobOptions};
+
 type LookupVar<'a> = Box<dyn Fn(&str) -> Option<String> + 'a>;
 type CommandSubst<'a> = Box<dyn Fn(&str) -> Result<String, String> + 'a>;
 
 pub struct ExpansionContext<'a> {
     pub lookup_var: LookupVar<'a>,
     pub lookup_array: Box<dyn Fn(&str) -> Option<Vec<String>> + 'a>,
+    pub lookup_assoc: Box<dyn Fn(&str) -> Option<std::collections::HashMap<String, String>> + 'a>,
     pub command_subst: CommandSubst<'a>,
     // Separate positional slice for function-style parameters.
     pub positional: &'a [String],
@@ -163,7 +166,7 @@ where
             } else {
                 let (inner, closed) = parse_command_substitution_lenient(chars)?;
                 if !closed {
-                    return Ok(Some(format!("$({inner}")));
+                    return Ok(Some(format!("$({inner})")));
                 }
                 let output = (ctx.command_subst)(&inner)?;
                 Ok(Some(output))
@@ -201,20 +204,21 @@ where
                         "Unterminated parameter expansion ${}".to_string(),
                     )
                     .with_context("Missing closing brace: ${variable}")
-                    .into());
+                    .to_string());
                 }
                 return Ok(Some(format!("${{{inner}")));
             }
             let param = parse_parameter(&inner)?;
             let name = strip_markers(param.name());
-            if !is_valid_var_name(&name) {
+            let needs_validation = !matches!(param, Parameter::PrefixVars { .. });
+            if needs_validation && !is_valid_var_name(&name) {
                 if ctx.strict {
                     return Err(ShellError::new(
                         ErrorKind::Expansion,
                         format!("Invalid variable name: {}", name),
                     )
                     .with_context("Variable names must start with a letter or underscore, followed by letters, digits, or underscores")
-                    .into());
+                    .to_string());
                 }
                 return Ok(Some(format!("${{{inner}}}")));
             }
@@ -257,10 +261,56 @@ where
                 }
                 Parameter::Array { index, length, .. } => {
                     let arr = (ctx.lookup_array)(&name);
-                    if let Some(value) = expand_array_ref(&name, index.as_deref(), length, ctx, arr) {
+                    if let Some(value) =
+                        expand_array_ref(&name, index.as_deref(), length, ctx, arr)
+                    {
+                        return Ok(Some(value));
+                    }
+                    if let Some(map) = (ctx.lookup_assoc)(&name) {
+                        if let Some(value) =
+                            expand_assoc_ref(index.as_deref(), length, ctx, &map)
+                        {
+                            return Ok(Some(value));
+                        }
+                    }
+                    Ok(Some(String::new()))
+                }
+                Parameter::Assoc { key, length, .. } => {
+                    if let Some(map) = (ctx.lookup_assoc)(&name) {
+                        if let Some(value) = expand_assoc_ref(Some(&key), length, ctx, &map) {
+                            return Ok(Some(value));
+                        }
+                    }
+                    Ok(Some(String::new()))
+                }
+                Parameter::AssocKeys { .. } => {
+                    if let Some(map) = (ctx.lookup_assoc)(&name) {
+                        let value = expand_assoc_keys(ctx, &map);
                         return Ok(Some(value));
                     }
                     Ok(Some(String::new()))
+                }
+                Parameter::PrefixVars { prefix } => {
+                    let ifs = (ctx.lookup_var)("IFS").unwrap_or_else(|| " \t\n".to_string());
+                    let sep = ifs.chars().next().unwrap_or(' ');
+                    let mut keys: Vec<String> = std::env::vars()
+                        .map(|(k, _)| k)
+                        .filter(|k| k.starts_with(&prefix))
+                        .collect();
+                    keys.sort();
+                    Ok(Some(keys.join(&sep.to_string())))
+                }
+                Parameter::Transform { op, .. } => {
+                    let value = (ctx.lookup_var)(&name).unwrap_or_default();
+                    Ok(Some(transform_value(&value, op)))
+                }
+                Parameter::Substring {
+                    offset,
+                    length,
+                    ..
+                } => {
+                    let value = (ctx.lookup_var)(&name).unwrap_or_default();
+                    Ok(Some(substring_value(&value, offset, length)))
                 }
                 Parameter::Simple { length, .. } => {
                     if length {
@@ -305,6 +355,15 @@ enum Parameter {
         replacement: String,
     },
     Array { name: String, index: Option<String>, length: bool },
+    Assoc { name: String, key: String, length: bool },
+    AssocKeys { name: String },
+    PrefixVars { prefix: String },
+    Transform { name: String, op: TransformOp },
+    Substring {
+        name: String,
+        offset: usize,
+        length: Option<usize>,
+    },
 }
 
 impl Parameter {
@@ -315,6 +374,11 @@ impl Parameter {
             Parameter::Pattern { name, .. } => name,
             Parameter::Subst { name, .. } => name,
             Parameter::Array { name, .. } => name,
+            Parameter::Assoc { name, .. } => name,
+            Parameter::AssocKeys { name, .. } => name,
+            Parameter::Transform { name, .. } => name,
+            Parameter::Substring { name, .. } => name,
+            Parameter::PrefixVars { .. } => "",
         }
     }
 }
@@ -327,6 +391,18 @@ fn parse_parameter(input: &str) -> Result<Parameter, String> {
         });
     }
 
+    if let Some(inner) = input.strip_prefix('!') {
+        if inner.ends_with('*') && !inner.contains('[') {
+            let prefix = inner.trim_end_matches('*').to_string();
+            return Ok(Parameter::PrefixVars { prefix });
+        }
+        if let Some((name, idx)) = parse_array_ref(inner) {
+            if matches!(idx.as_deref(), Some("@") | Some("*")) {
+                return Ok(Parameter::AssocKeys { name });
+            }
+        }
+    }
+
     let (length, inner) = if let Some(rest) = input.strip_prefix('#') {
         (true, rest)
     } else {
@@ -334,9 +410,26 @@ fn parse_parameter(input: &str) -> Result<Parameter, String> {
     };
 
     if let Some((name, index)) = parse_array_ref(inner) {
+        if let Some(ref key) = index {
+            if key != "@" && key != "*" && key.parse::<usize>().is_err() {
+                return Ok(Parameter::Assoc {
+                    name,
+                    key: key.clone(),
+                    length,
+                });
+            }
+        }
         return Ok(Parameter::Array {
             name,
             index,
+            length,
+        });
+    }
+
+    if let Some((name, offset, length)) = parse_substring(inner) {
+        return Ok(Parameter::Substring {
+            name,
+            offset,
             length,
         });
     }
@@ -363,6 +456,10 @@ fn parse_parameter(input: &str) -> Result<Parameter, String> {
             op: ParamOp::Suffix,
             pattern: pattern.to_string(),
         });
+    }
+
+    if let Some((name, op)) = parse_transform(inner) {
+        return Ok(Parameter::Transform { name, op });
     }
 
     Ok(Parameter::Simple {
@@ -397,8 +494,58 @@ fn parse_subst(input: &str) -> Option<(String, String, String)> {
     Some((name, pattern, replacement))
 }
 
+#[derive(Copy, Clone)]
+enum TransformOp {
+    UpperAll,
+    LowerAll,
+    UpperFirst,
+    LowerFirst,
+    Toggle,
+}
+
+fn parse_transform(input: &str) -> Option<(String, TransformOp)> {
+    if let Some(name) = input.strip_suffix("^^") {
+        return Some((name.to_string(), TransformOp::UpperAll));
+    }
+    if let Some(name) = input.strip_suffix(",,") {
+        return Some((name.to_string(), TransformOp::LowerAll));
+    }
+    if let Some(name) = input.strip_suffix('^') {
+        return Some((name.to_string(), TransformOp::UpperFirst));
+    }
+    if let Some(name) = input.strip_suffix(',') {
+        return Some((name.to_string(), TransformOp::LowerFirst));
+    }
+    if let Some(name) = input.strip_suffix('~') {
+        return Some((name.to_string(), TransformOp::Toggle));
+    }
+    None
+}
+
+fn parse_substring(input: &str) -> Option<(String, usize, Option<usize>)> {
+    let (name, rest) = input.split_once(':')?;
+    if name.is_empty() {
+        return None;
+    }
+    if rest.starts_with('-') {
+        return None;
+    }
+    let (offset_str, len_str) = if let Some((off, len)) = rest.split_once(':') {
+        (off, Some(len))
+    } else {
+        (rest, None)
+    };
+    let offset = offset_str.parse::<usize>().ok()?;
+    let length = match len_str {
+        Some(s) if !s.is_empty() => Some(s.parse::<usize>().ok()?),
+        Some(_) => None,
+        None => None,
+    };
+    Some((name.to_string(), offset, length))
+}
+
 fn expand_array_ref(
-    name: &str,
+    _name: &str,
     index: Option<&str>,
     length: bool,
     ctx: &ExpansionContext<'_>,
@@ -431,6 +578,88 @@ fn expand_array_ref(
             return Some(values.join(&sep.to_string()));
         }
     }
+}
+
+fn expand_assoc_ref(
+    index: Option<&str>,
+    length: bool,
+    ctx: &ExpansionContext<'_>,
+    map: &std::collections::HashMap<String, String>,
+) -> Option<String> {
+    match index {
+        Some("@") | Some("*") | None => {
+            if length {
+                return Some(map.len().to_string());
+            }
+            let ifs = (ctx.lookup_var)("IFS").unwrap_or_else(|| " \t\n".to_string());
+            let sep = ifs.chars().next().unwrap_or(' ');
+            let values: Vec<String> = map.values().cloned().collect();
+            Some(values.join(&sep.to_string()))
+        }
+        Some(key) => {
+            let value = map.get(key).cloned().unwrap_or_default();
+            if length {
+                return Some(value.chars().count().to_string());
+            }
+            Some(value)
+        }
+    }
+}
+
+fn expand_assoc_keys(ctx: &ExpansionContext<'_>, map: &std::collections::HashMap<String, String>) -> String {
+    let ifs = (ctx.lookup_var)("IFS").unwrap_or_else(|| " \t\n".to_string());
+    let sep = ifs.chars().next().unwrap_or(' ');
+    let keys: Vec<String> = map.keys().cloned().collect();
+    keys.join(&sep.to_string())
+}
+
+fn transform_value(value: &str, op: TransformOp) -> String {
+    match op {
+        TransformOp::UpperAll => value.chars().flat_map(|c| c.to_uppercase()).collect(),
+        TransformOp::LowerAll => value.chars().flat_map(|c| c.to_lowercase()).collect(),
+        TransformOp::UpperFirst => {
+            let mut chars = value.chars();
+            let Some(first) = chars.next() else {
+                return String::new();
+            };
+            let mut out: String = first.to_uppercase().collect();
+            out.push_str(chars.as_str());
+            out
+        }
+        TransformOp::LowerFirst => {
+            let mut chars = value.chars();
+            let Some(first) = chars.next() else {
+                return String::new();
+            };
+            let mut out: String = first.to_lowercase().collect();
+            out.push_str(chars.as_str());
+            out
+        }
+        TransformOp::Toggle => value
+            .chars()
+            .map(|c| {
+                if c.is_lowercase() {
+                    c.to_uppercase().collect::<String>()
+                } else if c.is_uppercase() {
+                    c.to_lowercase().collect::<String>()
+                } else {
+                    c.to_string()
+                }
+            })
+            .collect(),
+    }
+}
+
+fn substring_value(value: &str, offset: usize, length: Option<usize>) -> String {
+    let chars: Vec<char> = value.chars().collect();
+    if offset >= chars.len() {
+        return String::new();
+    }
+    let end = match length {
+        Some(len) => std::cmp::min(chars.len(), offset + len),
+        None => chars.len(),
+    };
+    chars[offset..end].iter().collect()
 }
 
 fn replace_first_pattern(value: &str, pattern: &str, replacement: &str) -> Result<String, String> {
@@ -747,6 +976,7 @@ mod tests {
         ExpansionContext {
             lookup_var: Box::new(|name| env::var(name).ok()),
             lookup_array: Box::new(|_| None),
+            lookup_assoc: Box::new(|_| None),
             command_subst: Box::new(|_| Ok(String::new())),
             positional: &[],
             strict: true,
@@ -759,6 +989,31 @@ mod tests {
             lookup_array: Box::new(move |key| {
                 if key == name {
                     Some(values.clone())
+                } else {
+                    None
+                }
+            }),
+            lookup_assoc: Box::new(|_| None),
+            command_subst: Box::new(|_| Ok(String::new())),
+            positional: &[],
+            strict: true,
+        }
+    }
+
+    fn ctx_with_assoc(
+        name: &'static str,
+        values: Vec<(&'static str, &'static str)>,
+    ) -> ExpansionContext<'static> {
+        let mut map = std::collections::HashMap::new();
+        for (k, v) in values {
+            map.insert(k.to_string(), v.to_string());
+        }
+        ExpansionContext {
+            lookup_var: Box::new(|_| None),
+            lookup_array: Box::new(|_| None),
+            lookup_assoc: Box::new(move |key| {
+                if key == name {
+                    Some(map.clone())
                 } else {
                     None
                 }
@@ -814,6 +1069,55 @@ mod tests {
         let ctx = ctx_with_array("arr", vec!["a".into(), "bb".into()]);
         assert_eq!(expand_token("${#arr[@]}", &ctx).unwrap(), "2");
         assert_eq!(expand_token("${#arr[1]}", &ctx).unwrap(), "2");
+    }
+
+    #[test]
+    fn expand_assoc_lookup() {
+        let ctx = ctx_with_assoc("map", vec![("k1", "v1"), ("k2", "v2")]);
+        assert_eq!(expand_token("${map[k1]}", &ctx).unwrap(), "v1");
+    }
+
+    #[test]
+    fn expand_assoc_keys() {
+        let ctx = ctx_with_assoc("map", vec![("k1", "v1"), ("k2", "v2")]);
+        let expanded = expand_token("${!map[@]}", &ctx).unwrap();
+        let parts: Vec<_> = expanded.split_whitespace().collect();
+        assert_eq!(parts.len(), 2);
+        assert!(parts.contains(&"k1"));
+        assert!(parts.contains(&"k2"));
+    }
+
+    #[test]
+    fn expand_transform_upper_lower() {
+        let ctx = ctx_no_subst();
+        with_env_var("CS_TEST_CASE", "abC", || {
+            assert_eq!(expand_token("${CS_TEST_CASE^^}", &ctx).unwrap(), "ABC");
+            assert_eq!(expand_token("${CS_TEST_CASE,,}", &ctx).unwrap(), "abc");
+            assert_eq!(expand_token("${CS_TEST_CASE^}", &ctx).unwrap(), "AbC");
+            assert_eq!(expand_token("${CS_TEST_CASE,}", &ctx).unwrap(), "abC");
+        });
+    }
+
+    #[test]
+    fn expand_substring_offsets() {
+        let ctx = ctx_no_subst();
+        with_env_var("CS_TEST_SUB", "abcdef", || {
+            assert_eq!(expand_token("${CS_TEST_SUB:2}", &ctx).unwrap(), "cdef");
+            assert_eq!(expand_token("${CS_TEST_SUB:1:3}", &ctx).unwrap(), "bcd");
+        });
+    }
+
+    #[test]
+    fn expand_prefix_vars() {
+        let ctx = ctx_no_subst();
+        with_env_var("CS_PREFIX_ONE", "1", || {
+            with_env_var("CS_PREFIX_TWO", "2", || {
+                let expanded = expand_token("${!CS_PREFIX_*}", &ctx).unwrap();
+                let parts: Vec<_> = expanded.split_whitespace().collect();
+                assert!(parts.contains(&"CS_PREFIX_ONE"));
+                assert!(parts.contains(&"CS_PREFIX_TWO"));
+            });
+        });
     }
 
     #[test]
@@ -888,11 +1192,9 @@ mod tests {
     fn brace_expansion_ignores_quoted_braces() {
         let ctx = ctx_no_subst();
         let token = format!(
-            "{ESCAPE_MARKER}{{{ESCAPE_MARKER}a{ESCAPE_MARKER},{ESCAPE_MARKER}b{ESCAPE_MARKER}}"
+            "{ESCAPE_MARKER}{{{{ESCAPE_MARKER}}a{ESCAPE_MARKER},{ESCAPE_MARKER}b{ESCAPE_MARKER}}}}}"
         );
         let expanded = expand_tokens(vec![token], &ctx).unwrap();
-        assert_eq!(strip_markers(&expanded[0]), "{a,b}");
+    assert_eq!(strip_markers(&expanded[0]), "{a,b}");
     }
-
-    use tempfile::tempdir;
 }

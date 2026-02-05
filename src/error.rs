@@ -11,14 +11,17 @@ use std::fmt;
 
 /// Categorized error types for better diagnostics
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
 pub enum ErrorKind {
     /// Syntax error during tokenization/parsing
     Parse,
     /// Error during variable/glob expansion
     Expansion,
     /// Error with input/output redirections
+    #[allow(dead_code)]
     Redirection,
     /// Error executing a command
+    #[allow(dead_code)]
     Execution,
     /// Error loading/parsing configuration
     Config,
@@ -38,6 +41,7 @@ impl fmt::Display for ErrorKind {
 
 /// Rich error type with context information
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct ShellError {
     pub kind: ErrorKind,
     pub message: String,
@@ -71,6 +75,7 @@ impl ShellError {
     }
 
     /// Format error with a snippet of the input showing where the problem is
+    #[allow(dead_code)]
     pub fn display_with_input(&self, input: &str) -> String {
         let mut msg = format!("{}: {}", self.kind, self.message);
 
@@ -116,4 +121,5 @@ impl fmt::Display for ShellError {
 impl std::error::Error for ShellError {}
 
 /// Convenience type alias for Results with ShellError
+#[allow(dead_code)]
 pub type ShellResult<T> = Result<T, ShellError>;

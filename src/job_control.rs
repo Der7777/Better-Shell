@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+use std::fs;
 use std::io;
 use std::os::fd::AsFd;
 use std::os::unix::process::CommandExt;
@@ -165,6 +167,16 @@ pub struct Job {
     pub count: usize,
     pub command: String,
     pub status: JobStatus,
+}
+
+pub struct Coprocess {
+    pub pid: i32,
+    pub pgid: i32,
+    pub command: String,
+    pub in_path: String,
+    pub out_path: String,
+    pub in_hold: fs::File,
+    pub out_hold: fs::File,
 }
 
 pub enum JobPoll {
@@ -415,6 +427,28 @@ pub fn reap_jobs(jobs: &mut Vec<Job>) {
             }
         }
     }
+}
+
+pub fn reap_coprocs(coprocs: &mut HashMap<String, Coprocess>) -> Vec<String> {
+    let mut removed = Vec::new();
+    let names: Vec<String> = coprocs.keys().cloned().collect();
+    for name in names {
+        let done = if let Some(proc) = coprocs.get(&name) {
+            matches!(poll_job_status(proc.pgid), JobPoll::Done)
+        } else {
+            false
+        };
+        if done {
+            if let Some(proc) = coprocs.remove(&name) {
+                let _ = fs::remove_file(&proc.in_path);
+                let _ = fs::remove_file(&proc.out_path);
+                println!("[coproc {name}] Done {}", proc.command);
+            }
+            std::env::remove_var(format!("{name}_PID"));
+            removed.push(name);
+        }
+    }
+    removed
 }
 
 fn poll_job_status(pgid: i32) -> JobPoll {

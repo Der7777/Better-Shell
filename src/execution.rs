@@ -19,10 +19,7 @@ mod redirection;
 mod sandbox;
 mod spawning;
 
-pub use sandbox::{
-    apply_sandbox_directive, sandbox_options_for_command, SandboxBackend, SandboxConfig,
-    SandboxOptions,
-};
+pub use sandbox::{apply_sandbox_directive, sandbox_options_for_command, SandboxConfig};
 pub use spawning::{
     build_command, run_command_in_foreground, spawn_command_background, spawn_command_sandboxed,
     spawn_pipeline_background, spawn_pipeline_sandboxed, wrap_spawn_error,
@@ -56,6 +53,7 @@ pub struct BuiltinPipeResult {
 pub struct BuiltinPipeCaptureResult {
     pub output: String,
     pub status_code: i32,
+    #[allow(dead_code)]
     pub pipefail_status: i32,
 }
 
@@ -230,7 +228,7 @@ pub fn builtin_pipe<F, G>(
 ) -> io::Result<BuiltinPipeResult>
 where
     F: FnMut(&CommandSpec) -> bool,
-    G: FnMut(&CommandSpec, Option<&mut dyn Read>) -> io::Result<CaptureResult>,
+    G: FnMut(&CommandSpec, Option<Box<dyn Read>>) -> io::Result<CaptureResult>,
 {
     let mut input: Option<String> = None;
     let mut status_code = 0;
@@ -239,9 +237,8 @@ where
     for (idx, cmd) in pipeline.iter().enumerate() {
         let last = idx + 1 == pipeline.len();
         if is_builtin(cmd) {
-            let mut stdin =
-                command_stdin_reader(cmd, input.as_deref().map(|data| data.as_bytes()))?;
-            let result = run_builtin(cmd, stdin.as_deref_mut())?;
+            let stdin = command_stdin_reader(cmd, input.as_deref().map(|data| data.as_bytes()))?;
+            let result = run_builtin(cmd, stdin)?;
             status_code = result.status_code;
             if result.status_code != 0 {
                 pipefail_status = result.status_code;
@@ -285,7 +282,7 @@ pub fn builtin_pipe_capture<F, G>(
 ) -> io::Result<BuiltinPipeCaptureResult>
 where
     F: FnMut(&CommandSpec) -> bool,
-    G: FnMut(&CommandSpec, Option<&mut dyn Read>) -> io::Result<CaptureResult>,
+    G: FnMut(&CommandSpec, Option<Box<dyn Read>>) -> io::Result<CaptureResult>,
 {
     let mut input: Option<String> = None;
     let mut output = String::new();
@@ -295,9 +292,8 @@ where
     for (idx, cmd) in pipeline.iter().enumerate() {
         let last = idx + 1 == pipeline.len();
         if is_builtin(cmd) {
-            let mut stdin =
-                command_stdin_reader(cmd, input.as_deref().map(|data| data.as_bytes()))?;
-            let result = run_builtin(cmd, stdin.as_deref_mut())?;
+            let stdin = command_stdin_reader(cmd, input.as_deref().map(|data| data.as_bytes()))?;
+            let result = run_builtin(cmd, stdin)?;
             status_code = result.status_code;
             if result.status_code != 0 {
                 pipefail_status = result.status_code;

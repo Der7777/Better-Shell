@@ -4,9 +4,8 @@ use rustyline::completion::{Completer, FilenameCompleter, Pair};
 use rustyline::error::ReadlineError;
 use rustyline::highlight::{Highlighter, MatchingBracketHighlighter};
 use rustyline::hint::Hinter;
-use rustyline::history::{DefaultHistory, SearchDirection};
+use rustyline::history::SearchDirection;
 use rustyline::validate::{MatchingBracketValidator, Validator};
-use rustyline::Editor;
 use rustyline::{Context, Helper};
 
 #[cfg(feature = "tree-sitter")]
@@ -21,7 +20,7 @@ use std::cell::RefCell;
 use crate::colors::{resolve_color, ColorConfig};
 use crate::completions::{completion_candidates, CompletionSet};
 
-mod matching;
+pub(crate) mod matching;
 mod suggestions;
 
 pub use suggestions::update_completion_context;

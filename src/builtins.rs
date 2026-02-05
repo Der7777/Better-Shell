@@ -1,14 +1,17 @@
-mod config_cmds;
+pub(crate) mod config_cmds;
 mod control_flow;
 mod job_cmds;
 mod scripting;
 
 pub(crate) use scripting::execute_function;
+pub(crate) use config_cmds::load_assoc_arrays;
 
 use std::fmt::Write;
 use std::io::{self, Read};
 use std::path::Path;
 use std::{env, fs};
+
+use rustyline::history::{History, SearchDirection};
 
 use crate::completions::suggest_command;
 use crate::error::{ErrorKind, ShellError};
@@ -16,49 +19,80 @@ use crate::execution::{
     build_command, command_stdin_reader, run_command_in_foreground, sandbox_options_for_command,
     status_from_error, write_command_output, CaptureResult,
 };
-use crate::job_control::{add_job_with_status, list_jobs, JobStatus, WaitOutcome};
-use crate::parse::CommandSpec;
+use crate::job_control::{add_job_with_status, list_jobs, parse_job_id, take_job, JobStatus, WaitOutcome};
+use rustyline::{Cmd, KeyCode, KeyEvent, Modifiers, Movement};
+use crate::parse::{parse_line_lenient, CommandSpec};
+use crate::execute_segment;
 use crate::ShellState;
 
 use config_cmds::{
     handle_abbr, handle_complete, handle_fish_config, handle_history, handle_set_color,
-    handle_source,
+    handle_source, save_assoc_arrays,
 };
 use control_flow::{
     execute_brace_group, execute_case, execute_for, execute_if, execute_select, execute_while,
-    is_brace_group_start, is_case_start, is_for_start, is_if_start, is_select_start,
-    is_while_start, read_compound_tokens, CompoundKind,
+    execute_coproc, is_brace_group_start, is_case_start, is_coproc_start, is_for_start,
+    is_if_start, is_select_start, is_while_start, read_compound_tokens, CompoundKind,
 };
 use job_cmds::{handle_bg, handle_fg};
 use scripting::{define_function, execute_script_tokens, is_function_def_start};
 
+const BUILTINS: &[&str] = &[
+    "exit",
+    "cd",
+    "pwd",
+    "jobs",
+    "fg",
+    "bg",
+    "help",
+    "hash",
+    "echo",
+    "true",
+    "false",
+    "unset",
+    "local",
+    "declare",
+    "readonly",
+    "shift",
+    "eval",
+    "alias",
+    "unalias",
+    "disown",
+    "bind",
+    "getopts",
+    "type",
+    "fc",
+    "abbr",
+    "complete",
+    "set_color",
+    "fish_config",
+    "source",
+    "history",
+    "set",
+    "enable",
+    "shopt",
+    "trap",
+];
+
+pub fn builtin_names() -> &'static [&'static str] {
+    BUILTINS
+}
+
 pub fn is_builtin(cmd: Option<&str>) -> bool {
-    matches!(
-        cmd,
-        Some(
-            "exit"
-                | "cd"
-                | "pwd"
-                | "jobs"
-                | "fg"
-                | "bg"
-                | "help"
-                | "echo"
-                | "true"
-                | "false"
-                | "unset"
-                | "local"
-                | "getopts"
-                | "type"
-                | "fc"
-                | "abbr"
-                | "complete"
-                | "set_color"
-                | "fish_config"
-                | "source"
-                | "history"
-        )
-    )
+    cmd.is_some_and(|name| BUILTINS.contains(&name))
+}
+
+pub fn is_builtin_enabled_map(
+    enabled: &std::collections::HashMap<String, bool>,
+    cmd: Option<&str>,
+) -> bool {
+    let Some(name) = cmd else {
+        return false;
+    };
+    if !is_builtin(Some(name)) {
+        return false;
+    }
+    enabled.get(name).copied().unwrap_or(false)
 }
 
 pub fn try_execute_compound(
@@ -96,6 +130,11 @@ pub fn try_execute_compound(
         execute_case(state, tokens, display)?;
         return Ok(Some(true));
     }
+    if is_coproc_start(tokens) {
+        let tokens = read_compound_tokens(state, tokens.to_vec(), CompoundKind::Coproc)?;
+        execute_coproc(state, tokens, display)?;
+        return Ok(Some(true));
+    }
     if is_function_def_start(tokens) {
         let tokens = read_compound_tokens(state, tokens.to_vec(), CompoundKind::Function)?;
         define_function(state, tokens)?;
@@ -107,9 +146,9 @@ pub fn try_execute_compound(
 pub fn execute_builtin(state: &mut ShellState, cmd: &CommandSpec, display: &str) -> io::Result<()> {
     let args = &cmd.args;
     let name = args.first().map(String::as_str);
-    if matches!(name, Some(name) if is_builtin(Some(name)) || name == "set") {
-        let mut stdin = command_stdin_reader(cmd, None)?;
-        let result = execute_builtin_capture(state, cmd, display, stdin.as_deref_mut())?;
+    if matches!(name, Some(name) if is_builtin(Some(name)) && state.is_builtin_enabled(name)) {
+        let stdin = command_stdin_reader(cmd, None)?;
+        let result = execute_builtin_capture(state, cmd, display, stdin)?;
         write_command_output(cmd, &result.output)?;
         state.last_status = result.status_code;
         return Ok(());
@@ -181,10 +220,10 @@ pub fn execute_builtin_capture(
     state: &mut ShellState,
     cmd: &CommandSpec,
     display: &str,
-    mut stdin: Option<&mut dyn Read>,
+    mut stdin: Option<Box<dyn Read>>,
 ) -> io::Result<CaptureResult> {
     let mut output = String::new();
-    let status = execute_builtin_with_output(state, cmd, display, stdin, &mut output)?;
+    let status = execute_builtin_with_output(state, cmd, display, stdin.take(), &mut output)?;
     Ok(CaptureResult {
         output,
         status_code: status,
@@ -195,7 +234,7 @@ fn execute_builtin_with_output(
     state: &mut ShellState,
     cmd: &CommandSpec,
     _display: &str,
-    _stdin: Option<&mut dyn Read>,
+    _stdin: Option<Box<dyn Read>>,
     output: &mut String,
 ) -> io::Result<i32> {
     let args = &cmd.args;
@@ -262,7 +301,7 @@ fn execute_builtin_with_output(
             }
             let _ = writeln!(
                 output,
-                "Built-ins: cd [dir], pwd, jobs, fg [id], bg [id], help, exit [code], echo, true, false, unset, local, getopts, type, fc, abbr, complete"
+                "Built-ins: cd [dir], pwd, jobs, fg [id], bg [id], help, exit [code], hash, echo, true, false, unset, local, declare, readonly, shift, eval, alias, unalias, disown, bind, getopts, type, fc, abbr, complete, enable, shopt, trap"
             );
             let _ = writeln!(
                 output,
@@ -305,6 +344,10 @@ fn execute_builtin_with_output(
                     state.unset_array_elem(&arr, idx);
                     continue;
                 }
+                if let Some((arr, key)) = parse_assoc_unset(name) {
+                    state.unset_assoc_elem(&arr, &key);
+                    continue;
+                }
                 if !crate::utils::is_valid_var_name(name) {
                     if let Some(arr_name) = name.strip_suffix("[]") {
                         if crate::utils::is_valid_var_name(arr_name) {
@@ -313,6 +356,11 @@ fn execute_builtin_with_output(
                         }
                     }
                     eprintln!("unset: invalid variable name '{name}'");
+                    failed = true;
+                    continue;
+                }
+                if state.readonly_vars.contains(name) {
+                    eprintln!("unset: {name}: readonly variable");
                     failed = true;
                     continue;
                 }
@@ -370,6 +418,42 @@ fn execute_builtin_with_output(
         Some("history") => {
             handle_history(state, args, output)?;
         }
+        Some("hash") => {
+            handle_hash(state, args, output)?;
+        }
+        Some("declare") => {
+            handle_declare(state, args)?;
+        }
+        Some("readonly") => {
+            handle_readonly(state, args, output)?;
+        }
+        Some("shift") => {
+            handle_shift(state, args)?;
+        }
+        Some("eval") => {
+            handle_eval(state, args)?;
+        }
+        Some("alias") => {
+            handle_alias(state, args, output)?;
+        }
+        Some("unalias") => {
+            handle_unalias(state, args)?;
+        }
+        Some("disown") => {
+            handle_disown(state, args)?;
+        }
+        Some("bind") => {
+            handle_bind(state, args, output)?;
+        }
+        Some("enable") => {
+            handle_enable(state, args, output)?;
+        }
+        Some("shopt") => {
+            handle_shopt(state, args, output)?;
+        }
+        Some("trap") => {
+            handle_trap(state, args, output)?;
+        }
         Some("echo") => {
             let line = args[1..].join(" ");
             let _ = writeln!(output, "{line}");
@@ -388,6 +472,12 @@ fn execute_builtin_with_output(
             } else if args.len() >= 3 && args[1] == "+o" && args[2] == "pipefail" {
                 state.pipefail = false;
                 state.last_status = 0;
+            } else if args.len() >= 3 && args[1] == "-o" && args[2] == "functrace" {
+                state.functrace = true;
+                state.last_status = 0;
+            } else if args.len() >= 3 && args[1] == "+o" && args[2] == "functrace" {
+                state.functrace = false;
+                state.last_status = 0;
             } else if args.len() >= 2 && args[1] == "-x" {
                 state.trace = true;
                 state.last_status = 0;
@@ -399,6 +489,11 @@ fn execute_builtin_with_output(
                     output,
                     "pipefail\t{}",
                     if state.pipefail { "on" } else { "off" }
+                );
+                let _ = writeln!(
+                    output,
+                    "functrace\t{}",
+                    if state.functrace { "on" } else { "off" }
                 );
                 let _ = writeln!(
                     output,
@@ -425,6 +520,7 @@ fn execute_builtin_with_output(
     Ok(state.last_status)
 }
 
+#[allow(dead_code)]
 pub fn execute_builtin_substitution(pipeline: &[CommandSpec]) -> Result<(String, i32), String> {
     if pipeline.len() != 1 {
         return Err("pipes only work with external commands".to_string());
@@ -435,7 +531,7 @@ pub fn execute_builtin_substitution(pipeline: &[CommandSpec]) -> Result<(String,
 
 pub fn execute_builtin_substitution_capture(
     cmd: &CommandSpec,
-    _stdin: Option<&mut dyn Read>,
+    _stdin: Option<Box<dyn Read>>,
 ) -> Result<CaptureResult, String> {
     let args = &cmd.args;
     match args.first().map(String::as_str) {
@@ -447,7 +543,7 @@ pub fn execute_builtin_substitution_capture(
             })
         }
         Some("help") => Ok(CaptureResult {
-            output: "Built-ins: cd [dir], pwd, jobs, fg [id], bg [id], help, exit [code], echo, true, false, unset, local, getopts, type, fc, abbr, complete"
+            output: "Built-ins: cd [dir], pwd, jobs, fg [id], bg [id], help, exit [code], hash, echo, true, false, unset, local, declare, readonly, shift, eval, alias, unalias, disown, bind, getopts, type, fc, abbr, complete, enable, shopt, trap"
                 .to_string(),
             status_code: 0,
         }),
@@ -469,39 +565,39 @@ pub fn execute_builtin_substitution_capture(
             "cd is not supported in command substitution".to_string(),
         )
         .with_context("Use '$(pwd)' to get the current directory")
-        .into()),
+        .to_string()),
         Some("exit") => Err(ShellError::new(
             ErrorKind::Execution,
             "exit is not supported in command substitution".to_string(),
         )
         .with_context("exit is only allowed at the top level, not in subshells")
-        .into()),
+        .to_string()),
         Some("abbr") => Err(ShellError::new(
             ErrorKind::Execution,
             "abbr is not supported in command substitution".to_string(),
         )
         .with_context("Abbreviations must be defined in the main shell, not in subshells")
-        .into()),
+        .to_string()),
         Some("complete") => Err(ShellError::new(
             ErrorKind::Execution,
             "complete is not supported in command substitution".to_string(),
         )
         .with_context("Completions must be defined in the main shell, not in subshells")
-        .into()),
+        .to_string()),
         Some("jobs") | Some("fg") | Some("bg") => {
             Err(ShellError::new(
                 ErrorKind::Execution,
                 "job control is not supported in command substitution".to_string(),
             )
             .with_context("Jobs exist only in the main shell; subshells have isolated process groups")
-            .into())
+            .to_string())
         }
         _ => Err(ShellError::new(
             ErrorKind::Execution,
             "built-in commands are not supported in command substitution".to_string(),
         )
         .with_context("Only external commands can be used in $(...) substitution")
-        .into()),
+        .to_string()),
     }
 }
 
@@ -603,7 +699,7 @@ fn handle_getopts(args: &[String]) -> io::Result<i32> {
     Ok(1)
 }
 
-fn handle_type(state: &ShellState, args: &[String], output: &mut String) -> io::Result<()> {
+fn handle_type(state: &mut ShellState, args: &[String], output: &mut String) -> io::Result<()> {
     if args.len() < 2 {
         eprintln!("usage: type [-a|-t] name...");
         state.last_status = 2;
@@ -642,7 +738,7 @@ fn handle_type(state: &ShellState, args: &[String], output: &mut String) -> io::
         if state.functions.contains_key(name) {
             entries.push(("function", name.to_string()));
         }
-        if is_builtin(Some(name)) || name == "set" {
+        if is_builtin(Some(name)) {
             entries.push(("builtin", name.to_string()));
         }
         if let Some(path) = find_in_path(name) {
@@ -685,15 +781,17 @@ fn handle_type(state: &ShellState, args: &[String], output: &mut String) -> io::
 }
 
 fn handle_fc(state: &mut ShellState, args: &[String], output: &mut String) -> io::Result<()> {
-    let mut list_only = false;
+    let mut _list_only = false;
     let mut no_numbers = false;
     let mut reverse = false;
+    let mut reexecute = false;
     let mut idx = 1usize;
     while idx < args.len() {
         match args[idx].as_str() {
-            "-l" => list_only = true,
+            "-l" => _list_only = true,
             "-n" => no_numbers = true,
             "-r" => reverse = true,
+            "-s" => reexecute = true,
             "--" => {
                 idx += 1;
                 break;
@@ -708,11 +806,57 @@ fn handle_fc(state: &mut ShellState, args: &[String], output: &mut String) -> io
         idx += 1;
     }
 
-    if !list_only {
-        list_only = true;
+    let history_len = state.editor.history().len();
+    if reexecute {
+        if history_len == 0 {
+            eprintln!("fc: history is empty");
+            state.last_status = 1;
+            return Ok(());
+        }
+        let mut entries: Vec<String> = state
+            .editor
+            .history()
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        if let Some(last) = entries.last() {
+            if last == args.join(" ").as_str() && entries.len() > 1 {
+                entries.pop();
+            }
+        }
+        let command = if idx < args.len() {
+            let prefix = &args[idx];
+            let mut found = None;
+            for entry in entries.iter().rev() {
+                if (*entry).starts_with(prefix) {
+                    found = Some(entry.clone());
+                    break;
+                }
+            }
+            match found {
+                Some(cmd) => cmd,
+                None => {
+                    eprintln!("fc: event not found: {prefix}");
+                    state.last_status = 1;
+                    return Ok(());
+                }
+            }
+        } else {
+            entries.last().cloned().unwrap_or_default()
+        };
+        let _ = writeln!(output, "{command}");
+        let tokens = match parse_line_lenient(&command) {
+            Ok(tokens) => tokens,
+            Err(msg) => {
+                eprintln!("fc: parse error: {msg}");
+                state.last_status = 2;
+                return Ok(());
+            }
+        };
+        execute_segment(state, tokens, &command)?;
+        return Ok(());
     }
 
-    let history_len = state.editor.history().len();
     let mut start = history_len.saturating_sub(16);
     let mut end = history_len.saturating_sub(1);
     if idx < args.len() {
@@ -746,11 +890,11 @@ fn handle_fc(state: &mut ShellState, args: &[String], output: &mut String) -> io
         Box::new(range.into_iter())
     };
     for i in iter {
-        if let Some(entry) = state.editor.history().get(i) {
+        if let Ok(Some(entry)) = state.editor.history().get(i, SearchDirection::Forward) {
             if no_numbers {
-                let _ = writeln!(output, "{entry}");
+                let _ = writeln!(output, "{}", entry.entry);
             } else {
-                let _ = writeln!(output, "{i} {entry}");
+                let _ = writeln!(output, "{} {}", entry.idx, entry.entry);
             }
         }
     }
@@ -779,7 +923,7 @@ fn resolve_history_index(history_len: usize, value: isize) -> usize {
     }
 }
 
-fn find_in_path(name: &str) -> Option<String> {
+pub(crate) fn find_in_path(name: &str) -> Option<String> {
     if name.contains('/') {
         let path = Path::new(name);
         if path.exists() {
@@ -826,18 +970,693 @@ fn parse_array_unset(input: &str) -> Option<(String, usize)> {
     Some((name, idx))
 }
 
+fn parse_assoc_unset(input: &str) -> Option<(String, String)> {
+    let open = input.find('[')?;
+    if !input.ends_with(']') {
+        return None;
+    }
+    let name = input[..open].to_string();
+    let key = &input[open + 1..input.len() - 1];
+    if key.is_empty() {
+        return None;
+    }
+    if key.parse::<usize>().is_ok() {
+        return None;
+    }
+    Some((name, key.to_string()))
+}
+
+fn handle_declare(state: &mut ShellState, args: &[String]) -> io::Result<()> {
+    if args.len() < 2 {
+        eprintln!("declare: missing option");
+        state.last_status = 2;
+        return Ok(());
+    }
+    if args[1] != "-A" {
+        eprintln!("declare: only -A is supported");
+        state.last_status = 2;
+        return Ok(());
+    }
+    if args.len() == 2 {
+        eprintln!("declare: missing name");
+        state.last_status = 2;
+        return Ok(());
+    }
+
+    let rest = &args[2..];
+    if let Some((name, values)) = parse_assoc_array_literal(rest) {
+        if !crate::utils::is_valid_var_name(&name) {
+            eprintln!("declare: invalid name '{name}'");
+            state.last_status = 2;
+            return Ok(());
+        }
+        state.set_assoc_array(&name, values);
+        if let Err(err) = save_assoc_arrays(&state.assoc_arrays) {
+            eprintln!("declare: failed to save arrays: {err}");
+            state.last_status = 1;
+            return Ok(());
+        }
+        state.last_status = 0;
+        return Ok(());
+    }
+
+    let mut failed = false;
+    for name in rest {
+        if !crate::utils::is_valid_var_name(name) {
+            eprintln!("declare: invalid name '{name}'");
+            failed = true;
+            continue;
+        }
+        state.assoc_arrays.entry(name.to_string()).or_default();
+    }
+    if let Err(err) = save_assoc_arrays(&state.assoc_arrays) {
+        eprintln!("declare: failed to save arrays: {err}");
+        state.last_status = 1;
+        return Ok(());
+    }
+    state.last_status = if failed { 2 } else { 0 };
+    Ok(())
+}
+
+fn handle_enable(state: &mut ShellState, args: &[String], output: &mut String) -> io::Result<()> {
+    let mut disable = false;
+    let mut print = false;
+    let mut idx = 1usize;
+    while idx < args.len() {
+        match args[idx].as_str() {
+            "-n" => disable = true,
+            "-p" => print = true,
+            "--" => {
+                idx += 1;
+                break;
+            }
+            _ if args[idx].starts_with('-') => {
+                eprintln!("enable: unsupported option '{}'", args[idx]);
+                state.last_status = 2;
+                return Ok(());
+            }
+            _ => break,
+        }
+        idx += 1;
+    }
+
+    if args.len() == 1 {
+        print = true;
+    }
+
+    if print {
+        for name in builtin_names() {
+            let enabled = state.builtin_enabled.get(*name).copied().unwrap_or(false);
+            if enabled {
+                let _ = writeln!(output, "enable {name}");
+            } else {
+                let _ = writeln!(output, "enable -n {name}");
+            }
+        }
+        state.last_status = 0;
+        return Ok(());
+    }
+
+    if idx >= args.len() {
+        eprintln!("enable: missing builtin name");
+        state.last_status = 2;
+        return Ok(());
+    }
+
+    let mut failed = false;
+    for name in &args[idx..] {
+        if !is_builtin(Some(name)) {
+            eprintln!("enable: not a builtin: {name}");
+            failed = true;
+            continue;
+        }
+        if name == "enable" && disable {
+            eprintln!("enable: cannot disable 'enable'");
+            failed = true;
+            continue;
+        }
+        state
+            .builtin_enabled
+            .insert(name.to_string(), !disable);
+    }
+    state.last_status = if failed { 1 } else { 0 };
+    Ok(())
+}
+
+fn handle_shopt(state: &mut ShellState, args: &[String], output: &mut String) -> io::Result<()> {
+    let mut set = None;
+    let mut print = false;
+    let mut idx = 1usize;
+    while idx < args.len() {
+        match args[idx].as_str() {
+            "-s" => set = Some(true),
+            "-u" => set = Some(false),
+            "-p" => print = true,
+            "--" => {
+                idx += 1;
+                break;
+            }
+            _ if args[idx].starts_with('-') => {
+                eprintln!("shopt: unsupported option '{}'", args[idx]);
+                state.last_status = 2;
+                return Ok(());
+            }
+            _ => break,
+        }
+        idx += 1;
+    }
+
+    if args.len() == 1 {
+        print = true;
+    }
+
+    if print {
+        let status = |value: bool| if value { "on" } else { "off" };
+        let _ = writeln!(output, "extglob\t{}", status(state.extglob));
+        let _ = writeln!(output, "nullglob\t{}", status(state.nullglob));
+        let _ = writeln!(output, "failglob\t{}", status(state.failglob));
+        let _ = writeln!(output, "dotglob\t{}", status(state.dotglob));
+        let _ = writeln!(output, "nocaseglob\t{}", status(state.nocaseglob));
+        let _ = writeln!(output, "dirspell\t{}", status(state.dirspell));
+        state.last_status = 0;
+        return Ok(());
+    }
+
+    if idx >= args.len() {
+        eprintln!("shopt: missing option name");
+        state.last_status = 2;
+        return Ok(());
+    }
+
+    let mut failed = false;
+    for name in &args[idx..] {
+        match name.as_str() {
+            "extglob" => {
+                if let Some(value) = set {
+                    state.extglob = value;
+                } else {
+                    state.extglob = true;
+                }
+            }
+            "nullglob" => {
+                if let Some(value) = set {
+                    state.nullglob = value;
+                } else {
+                    state.nullglob = true;
+                }
+            }
+            "failglob" => {
+                if let Some(value) = set {
+                    state.failglob = value;
+                } else {
+                    state.failglob = true;
+                }
+            }
+            "dotglob" => {
+                if let Some(value) = set {
+                    state.dotglob = value;
+                } else {
+                    state.dotglob = true;
+                }
+            }
+            "nocaseglob" => {
+                if let Some(value) = set {
+                    state.nocaseglob = value;
+                } else {
+                    state.nocaseglob = true;
+                }
+            }
+            "dirspell" => {
+                if let Some(value) = set {
+                    state.dirspell = value;
+                } else {
+                    state.dirspell = true;
+                }
+            }
+            _ => {
+                eprintln!("shopt: unsupported option '{name}'");
+                failed = true;
+            }
+        }
+    }
+    state.last_status = if failed { 1 } else { 0 };
+    Ok(())
+}
+
+fn handle_trap(state: &mut ShellState, args: &[String], output: &mut String) -> io::Result<()> {
+    if args.len() == 1 || (args.len() == 2 && args[1] == "-p") {
+        for (name, cmd) in state.traps.iter() {
+            let _ = writeln!(output, "trap '{}' {}", cmd, name);
+        }
+        state.last_status = 0;
+        return Ok(());
+    }
+
+    if args[1] == "-p" {
+        if args.len() < 3 {
+            state.last_status = 0;
+            return Ok(());
+        }
+        for name in &args[2..] {
+            if let Some(cmd) = state.traps.get(name) {
+                let _ = writeln!(output, "trap '{}' {}", cmd, name);
+            }
+        }
+        state.last_status = 0;
+        return Ok(());
+    }
+
+    if args[1] == "-" {
+        if args.len() < 3 {
+            eprintln!("trap: missing signal");
+            state.last_status = 2;
+            return Ok(());
+        }
+        for name in &args[2..] {
+            state.traps.remove(name);
+        }
+        state.last_status = 0;
+        return Ok(());
+    }
+
+    if args.len() < 3 {
+        eprintln!("trap: missing signal");
+        state.last_status = 2;
+        return Ok(());
+    }
+
+    let cmd = &args[1];
+    for name in &args[2..] {
+        match name.as_str() {
+            "DEBUG" | "RETURN" => {
+                state.traps.insert(name.to_string(), cmd.to_string());
+            }
+            _ => {
+                eprintln!("trap: unsupported signal '{name}'");
+                state.last_status = 2;
+                return Ok(());
+            }
+        }
+    }
+    state.last_status = 0;
+    Ok(())
+}
+
+fn handle_hash(state: &mut ShellState, args: &[String], output: &mut String) -> io::Result<()> {
+    let mut clear = false;
+    let mut idx = 1usize;
+    while idx < args.len() {
+        match args[idx].as_str() {
+            "-r" => clear = true,
+            "--" => {
+                idx += 1;
+                break;
+            }
+            _ if args[idx].starts_with('-') => {
+                eprintln!("hash: unsupported option '{}'", args[idx]);
+                state.last_status = 2;
+                return Ok(());
+            }
+            _ => break,
+        }
+        idx += 1;
+    }
+
+    if clear {
+        state.command_hash.clear();
+        state.last_status = 0;
+        return Ok(());
+    }
+
+    if idx >= args.len() {
+        let mut entries: Vec<_> = state.command_hash.iter().collect();
+        entries.sort_by_key(|(k, _)| *k);
+        for (name, path) in entries {
+            let _ = writeln!(output, "{name}={path}");
+        }
+        state.last_status = 0;
+        return Ok(());
+    }
+
+    let mut failed = false;
+    for name in &args[idx..] {
+        if let Some(path) = find_in_path(name) {
+            state.command_hash.insert(name.to_string(), path);
+        } else {
+            eprintln!("hash: {name}: not found");
+            failed = true;
+        }
+    }
+    state.last_status = if failed { 1 } else { 0 };
+    Ok(())
+}
+
+fn handle_readonly(state: &mut ShellState, args: &[String], output: &mut String) -> io::Result<()> {
+    if args.len() == 1 || (args.len() == 2 && args[1] == "-p") {
+        let mut entries: Vec<_> = state.readonly_vars.iter().collect();
+        entries.sort();
+        for name in entries {
+            let _ = writeln!(output, "readonly {name}");
+        }
+        state.last_status = 0;
+        return Ok(());
+    }
+
+    let mut idx = 1usize;
+    if args[1] == "-p" {
+        idx += 1;
+    }
+    let mut failed = false;
+    for entry in &args[idx..] {
+        let (name, value) = match entry.split_once('=') {
+            Some((name, value)) => (name, Some(value)),
+            None => (entry.as_str(), None),
+        };
+        if !crate::utils::is_valid_var_name(name) {
+            eprintln!("readonly: invalid name '{name}'");
+            failed = true;
+            continue;
+        }
+        if let Some(value) = value {
+            if state.readonly_vars.contains(name) {
+                eprintln!("readonly: {name}: readonly variable");
+                failed = true;
+                continue;
+            }
+            std::env::set_var(name, value);
+        }
+        state.readonly_vars.insert(name.to_string());
+    }
+    state.last_status = if failed { 1 } else { 0 };
+    Ok(())
+}
+
+fn handle_shift(state: &mut ShellState, args: &[String]) -> io::Result<()> {
+    if !state.in_local_scope() || state.positional_stack.is_empty() {
+        eprintln!("shift: only valid inside a function");
+        state.last_status = 2;
+        return Ok(());
+    }
+    let count = if args.len() >= 2 {
+        match args[1].parse::<usize>() {
+            Ok(n) => n,
+            Err(_) => {
+                eprintln!("shift: invalid count");
+                state.last_status = 2;
+                return Ok(());
+            }
+        }
+    } else {
+        1
+    };
+    let args_vec = state.positional_stack.last_mut().unwrap();
+    if count > args_vec.len() {
+        eprintln!("shift: count out of range");
+        state.last_status = 1;
+        return Ok(());
+    }
+    args_vec.drain(0..count);
+    state.last_status = 0;
+    Ok(())
+}
+
+fn handle_eval(state: &mut ShellState, args: &[String]) -> io::Result<()> {
+    if args.len() < 2 {
+        state.last_status = 0;
+        return Ok(());
+    }
+    let joined = args[1..].join(" ");
+    let tokens = parse_line_lenient(&joined)
+        .map_err(|msg| io::Error::new(io::ErrorKind::InvalidInput, msg))?;
+    if tokens.is_empty() {
+        state.last_status = 0;
+        return Ok(());
+    }
+    execute_script_tokens(state, tokens)?;
+    Ok(())
+}
+
+fn handle_alias(state: &mut ShellState, args: &[String], output: &mut String) -> io::Result<()> {
+    if args.len() == 1 || (args.len() == 2 && args[1] == "-p") {
+        let mut entries: Vec<_> = state.aliases.iter().collect();
+        entries.sort_by_key(|(name, _)| *name);
+        for (name, tokens) in entries {
+            let value = tokens
+                .iter()
+                .map(|t| shell_quote(t))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let _ = writeln!(output, "alias {name}={}", shell_quote(&value));
+        }
+        state.last_status = 0;
+        return Ok(());
+    }
+    let mut idx = 1usize;
+    if args[1] == "-p" {
+        idx += 1;
+    }
+    let mut failed = false;
+    for entry in &args[idx..] {
+        if let Some((name, value)) = entry.split_once('=') {
+            if !crate::utils::is_valid_var_name(name) {
+                eprintln!("alias: invalid name '{name}'");
+                failed = true;
+                continue;
+            }
+            let tokens = parse_line_lenient(value).unwrap_or_default();
+            if tokens.is_empty() {
+                eprintln!("alias: empty value for '{name}'");
+                failed = true;
+                continue;
+            }
+            state.aliases.insert(name.to_string(), tokens);
+        } else if let Some(tokens) = state.aliases.get(entry) {
+            let value = tokens
+                .iter()
+                .map(|t| shell_quote(t))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let _ = writeln!(output, "alias {entry}={}", shell_quote(&value));
+        } else {
+            eprintln!("alias: {entry}: not found");
+            failed = true;
+        }
+    }
+    state.last_status = if failed { 1 } else { 0 };
+    Ok(())
+}
+
+fn handle_unalias(state: &mut ShellState, args: &[String]) -> io::Result<()> {
+    if args.len() < 2 {
+        eprintln!("unalias: missing name");
+        state.last_status = 2;
+        return Ok(());
+    }
+    let mut failed = false;
+    for name in &args[1..] {
+        if state.aliases.remove(name).is_none() {
+            eprintln!("unalias: {name}: not found");
+            failed = true;
+        }
+    }
+    state.last_status = if failed { 1 } else { 0 };
+    Ok(())
+}
+
+fn handle_disown(state: &mut ShellState, args: &[String]) -> io::Result<()> {
+    let id = parse_job_id(args.get(1))?;
+    if take_job(&mut state.jobs, id).is_none() {
+        eprintln!("disown: no such job");
+        state.last_status = 1;
+        return Ok(());
+    }
+    state.last_status = 0;
+    Ok(())
+}
+
+fn handle_bind(state: &mut ShellState, args: &[String], output: &mut String) -> io::Result<()> {
+    if args.len() == 1 || (args.len() == 2 && args[1] == "-p") {
+        let mut entries: Vec<_> = state.bindings.iter().collect();
+        entries.sort_by_key(|(k, _)| *k);
+        for (key, action) in entries {
+            let _ = writeln!(output, "{key} {action}");
+        }
+        state.last_status = 0;
+        return Ok(());
+    }
+    let mut idx = 1usize;
+    if args[1] == "-p" {
+        idx += 1;
+    }
+    if idx + 1 >= args.len() {
+        eprintln!("bind: expected key and command");
+        state.last_status = 2;
+        return Ok(());
+    }
+    let key = &args[idx];
+    let action = &args[idx + 1];
+    let key_event = match parse_key_event(key) {
+        Some(ev) => ev,
+        None => {
+            eprintln!("bind: unsupported key '{key}'");
+            state.last_status = 2;
+            return Ok(());
+        }
+    };
+    let cmd = match parse_bind_cmd(action) {
+        Some(cmd) => cmd,
+        None => {
+            eprintln!("bind: unsupported action '{action}'");
+            state.last_status = 2;
+            return Ok(());
+        }
+    };
+    state.editor.bind_sequence(key_event, cmd);
+    state.bindings.insert(key.to_string(), action.to_string());
+    state.last_status = 0;
+    Ok(())
+}
+
+fn parse_key_event(input: &str) -> Option<KeyEvent> {
+    let mut mods = Modifiers::NONE;
+    let mut key = input.to_string();
+    let parts: Vec<&str> = input.split('-').collect();
+    if parts.len() > 1 {
+        for part in &parts[..parts.len() - 1] {
+            match part.to_ascii_uppercase().as_str() {
+                "C" | "CTRL" => mods |= Modifiers::CTRL,
+                "M" | "ALT" => mods |= Modifiers::ALT,
+                "S" | "SHIFT" => mods |= Modifiers::SHIFT,
+                _ => return None,
+            }
+        }
+        key = parts[parts.len() - 1].to_string();
+    }
+    let key_upper = key.to_ascii_uppercase();
+    let code = match key_upper.as_str() {
+        "TAB" => KeyCode::Tab,
+        "ENTER" => KeyCode::Enter,
+        "ESC" | "ESCAPE" => KeyCode::Esc,
+        "BACKSPACE" => KeyCode::Backspace,
+        _ => {
+            let ch = key.chars().next()?;
+            if key.len() == 1 {
+                return Some(KeyEvent::new(ch, mods));
+            }
+            return None;
+        }
+    };
+    Some(KeyEvent(code, mods))
+}
+
+fn parse_bind_cmd(input: &str) -> Option<Cmd> {
+    match input {
+        "history-search-backward" => Some(Cmd::HistorySearchBackward),
+        "history-search-forward" => Some(Cmd::HistorySearchForward),
+        "previous-history" => Some(Cmd::PreviousHistory),
+        "next-history" => Some(Cmd::NextHistory),
+        "backward-char" => Some(Cmd::Move(Movement::BackwardChar(1))),
+        "forward-char" => Some(Cmd::Move(Movement::ForwardChar(1))),
+        "beginning-of-line" => Some(Cmd::Move(Movement::BeginningOfLine)),
+        "end-of-line" => Some(Cmd::Move(Movement::EndOfLine)),
+        "complete" => Some(Cmd::Complete),
+        "accept-line" => Some(Cmd::AcceptLine),
+        _ => None,
+    }
+}
+
+fn shell_quote(token: &str) -> String {
+    if token.is_empty() || token.chars().any(needs_quotes) {
+        let mut out = String::from("'");
+        for ch in token.chars() {
+            if ch == '\'' {
+                out.push_str("'\\''");
+            } else {
+                out.push(ch);
+            }
+        }
+        out.push('\'');
+        out
+    } else {
+        token.to_string()
+    }
+}
+
+fn needs_quotes(ch: char) -> bool {
+    ch.is_whitespace()
+        || matches!(
+            ch,
+            '\'' | '"' | '\\' | '$' | '`' | '#' | '|' | '&' | ';' | '<' | '>'
+        )
+}
+
+fn parse_assoc_array_literal(
+    tokens: &[String],
+) -> Option<(String, std::collections::HashMap<String, String>)> {
+    let first = tokens.first()?;
+    let eq_pos = first.find("=(")?;
+    let name = first[..eq_pos].to_string();
+    let mut values = std::collections::HashMap::new();
+    let mut first_val = first[eq_pos + 2..].to_string();
+    if tokens.len() == 1 {
+        if first_val.ends_with(')') {
+            first_val.pop();
+            if !first_val.is_empty() {
+                parse_assoc_literal_item(&first_val, &mut values)?;
+            }
+            return Some((name, values));
+        }
+        return None;
+    }
+    if !first_val.is_empty() {
+        parse_assoc_literal_item(&first_val, &mut values)?;
+    }
+    for token in tokens.iter().skip(1).take(tokens.len() - 2) {
+        parse_assoc_literal_item(token, &mut values)?;
+    }
+    let mut last = tokens.last()?.clone();
+    if !last.ends_with(')') {
+        return None;
+    }
+    last.pop();
+    if !last.is_empty() {
+        parse_assoc_literal_item(&last, &mut values)?;
+    }
+    Some((name, values))
+}
+
+fn parse_assoc_literal_item(
+    token: &str,
+    values: &mut std::collections::HashMap<String, String>,
+) -> Option<()> {
+    if !token.starts_with('[') {
+        return None;
+    }
+    let close = token.find("]=")?;
+    let key = &token[1..close];
+    if key.is_empty() {
+        return None;
+    }
+    if key.parse::<usize>().is_ok() {
+        return None;
+    }
+    let value = &token[close + 2..];
+    values.insert(key.to_string(), value.to_string());
+    Some(())
+}
+
 fn execute_type_substitution(args: &[String]) -> Result<CaptureResult, String> {
     if args.len() < 2 {
         return Err(ShellError::new(
             ErrorKind::Execution,
             "type: missing name".to_string(),
         )
-        .into());
+        .to_string());
     }
     let mut output = String::new();
     let mut ok = true;
     for name in &args[1..] {
-        if is_builtin(Some(name)) || name == "set" {
+        if is_builtin(Some(name)) {
             output.push_str(&format!("{name} is a shell builtin\n"));
             continue;
         }

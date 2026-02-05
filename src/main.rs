@@ -25,7 +25,7 @@ mod signals;
 mod utils;
 
 pub(crate) use expansion_runner::build_expansion_context;
-pub(crate) use repl::{execute_segment, trace_tokens, ShellState};
+pub(crate) use repl::{execute_segment, run_return_trap, trace_tokens, ShellState};
 
 use repl::{init_state, run_once};
 use signals::{init_session, install_signal_handlers};
@@ -53,7 +53,7 @@ fn main() {
             }
         }
     }
-    let interactive = isatty(libc::STDIN_FILENO);
+    let interactive = isatty(libc::STDIN_FILENO).unwrap_or(false);
     if let Err(err) = install_signal_handlers() {
         eprintln!("error: {err}");
         return;
