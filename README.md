@@ -1,4 +1,4 @@
-# custom_shell
+# Better Shell
 
 A minimal Rust shell with job control, pipelines, redirection, and a small scripting layer.
 

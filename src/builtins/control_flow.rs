@@ -404,7 +404,7 @@ pub(crate) fn execute_coproc(
 
     let id = state.next_coproc_id;
     state.next_coproc_id += 1;
-    let base = format!("/tmp/custom_shell_coproc_{name}_{id}");
+    let base = format!("/tmp/better_shell_coproc_{name}_{id}");
     let in_path = format!("{base}_in");
     let out_path = format!("{base}_out");
     let _ = fs::remove_file(&in_path);

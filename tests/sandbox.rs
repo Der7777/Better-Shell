@@ -27,7 +27,7 @@ fn bwrap_available() -> bool {
 
 #[cfg(target_os = "linux")]
 fn run_shell(script: &str) -> std::process::Output {
-    let exe = env!("CARGO_BIN_EXE_custom_shell");
+    let exe = env!("CARGO_BIN_EXE_better_shell");
     let home = tempdir().expect("temp home");
     let mut cmd = Command::new(exe);
     cmd.arg("--sandbox=bwrap")

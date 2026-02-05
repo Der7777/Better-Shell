@@ -1,11 +1,11 @@
 [package]
-name = "custom_shell"
+name = "better_shell"
 version = "0.1.0"
 edition = "2021"
 
 authors = ["Der7777"]
 
-description = "A custom shell in Rust"
+description = "A better shell in Rust"
 
 [dependencies]
 rustyline = { version = "12", optional = true }
@@ -28,7 +28,7 @@ pty-tests = []
 sandbox = []
 
 [[bin]]
-name = "custom_shell"
+name = "better_shell"
 path = "src/main.rs"
 required-features = ["shell"]
 

@@ -144,7 +144,7 @@ pub(crate) fn handle_set_color(
 }
 
 pub(crate) fn handle_fish_config(state: &mut ShellState, output: &mut String) -> io::Result<()> {
-    let _ = writeln!(output, "Custom shell config (TUI placeholder).");
+    let _ = writeln!(output, "Better Shell config (TUI placeholder).");
     let _ = writeln!(output, "Current colors:");
     for line in format_color_lines(&state.colors) {
         let mut parts = line.splitn(2, '=');

@@ -5,7 +5,7 @@ use std::process::{Command, Stdio};
 use tempfile::TempDir;
 
 fn run_script(script: &str) -> (String, String, i32) {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_custom_shell"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_better_shell"))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

@@ -1,5 +1,5 @@
 [package]
-name = "custom_shell-fuzz"
+name = "better_shell-fuzz"
 version = "0.0.0"
 edition = "2021"
 publish = false
@@ -9,7 +9,7 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-custom_shell = { path = "..", default-features = false, features = ["expansion"] }
+better_shell = { path = "..", default-features = false, features = ["expansion"] }
 
 [workspace]
 members = ["."]

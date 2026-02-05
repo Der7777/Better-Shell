@@ -74,6 +74,28 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c08606f8c3cbf4ce6ec8e28fb0014a2c086708fe954eaa885384a6165172e7e8"
 
 [[package]]
+name = "better_shell"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "env_logger",
+ "glob",
+ "libc",
+ "log",
+ "nix 0.28.0",
+ "portable-pty",
+ "proptest",
+ "regex",
+ "rustyline",
+ "serial_test",
+ "signal-hook",
+ "tempfile",
+ "tree-sitter",
+ "tree-sitter-bash",
+ "tree-sitter-highlight",
+]
+
+[[package]]
 name = "bit-set"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -134,28 +156,6 @@ name = "colorchoice"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b05b61dc5112cbb17e4b6cd61790d9845d13888356391624cbe7e41efeac1e75"
-
-[[package]]
-name = "custom_shell"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "env_logger",
- "glob",
- "libc",
- "log",
- "nix 0.28.0",
- "portable-pty",
- "proptest",
- "regex",
- "rustyline",
- "serial_test",
- "signal-hook",
- "tempfile",
- "tree-sitter",
- "tree-sitter-bash",
- "tree-sitter-highlight",
-]
 
 [[package]]
 name = "dashmap"

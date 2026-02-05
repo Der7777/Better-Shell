@@ -107,7 +107,7 @@ pub(crate) fn init_state(
     let history_path = env::var("HOME")
         .map(PathBuf::from)
         .unwrap_or_default()
-        .join(".custom_shell_history");
+        .join(".better_shell_history");
     let _ = editor.load_history(&history_path);
 
     let mut state = ShellState {
@@ -373,7 +373,7 @@ pub(crate) fn run_once(state: &mut ShellState) -> io::Result<()> {
             let history_path = env::var("HOME")
                 .map(PathBuf::from)
                 .unwrap_or_default()
-                .join(".custom_shell_history");
+                .join(".better_shell_history");
             let _ = state.editor.save_history(&history_path);
             std::process::exit(0);
         }

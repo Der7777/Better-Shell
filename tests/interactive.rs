@@ -89,7 +89,7 @@ fn looks_like_prompt(buf: &str) -> bool {
 }
 
 fn bin_path() -> String {
-    env!("CARGO_BIN_EXE_custom_shell").to_string()
+    env!("CARGO_BIN_EXE_better_shell").to_string()
 }
 
 fn list_children(pid: u32) -> Vec<u32> {
